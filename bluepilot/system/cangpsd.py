@@ -56,9 +56,10 @@ MAX_FIX_AGE = 3.0
 # position at all.
 #
 # Why not a free-running cadence: a fresh fix would then wait up to a full publish period
-# before anyone saw it, adding latency on top of the ~0.47 s the whole-second UTC encoding
-# already costs us. Latency is a systematic along-track position error, which matters more
-# for map matching than the duplicate count does.
+# before anyone saw it, on top of the offset the car itself introduces (0.4-0.9 s, see
+# decode_utc). Latency is a systematic along-track position error, which matters more for
+# map matching than the duplicate count does, and unlike the car's offset this part is
+# ours to remove.
 KEEPALIVE_INTERVAL = 0.5
 
 
@@ -82,6 +83,16 @@ def decode_utc(vl: dict) -> datetime.datetime | None:
   month raw 15 -> 16, day raw 31 -> 32, hour raw 30/31, second raw 62/63 all
   land outside the legal range below, so there's no need to special-case them.
   This path is confirmed correct against a real rlog.
+
+  The label is whole seconds and reads behind true UTC -- measured against NTP at
+  -0.400 s on one drive, -0.905 and -0.790 on two others. Stable to +-50 ms within
+  a drive, half a second apart between boots, so it is the phase of the APIM's ~1 Hz
+  emission timer relative to UTC, re-rolled at each power-up, not a transport delay.
+  No constant can correct it, and the phase cannot be recovered from the bus: that
+  needs an external reference, and the only one is NTP, which is present exactly when
+  this daemon is not needed. Deliberately uncorrected. timed.py acts on a 10 s
+  threshold, so it never matters there; it costs 12-27 m of along-track position lag
+  at highway speed, which reaches map matching only.
   """
   if vl["Gps_B_Falt"] != 0:
     return None
