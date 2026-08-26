@@ -44,12 +44,35 @@ GPS_ADDR_QUALITY = 0x464
 # both 0x462 and 0x463 are ~1 Hz; beyond this we can no longer trust the held fix
 MAX_FIX_AGE = 3.0
 
-# SubMaster.alive for gpsLocationExternal is (now - last_recv) < 10 / declared_freq,
-# and services.py declares this topic at 10 Hz -> a 1.0 s alive window. A true 1 Hz
-# publish rate flaps that window; publishing every 3rd tick of a 10 Hz loop (~3.33 Hz)
-# clears it with margin while only feeding locationd_llk's Kalman filter a handful of
-# duplicate measurements per second instead of ten.
-PUBLISH_EVERY_N_TICKS = 3
+# Publishing is phase-locked to the CAN burst rather than free-running: send as soon as
+# a new 0x463 lands, then a held repeat if the topic would otherwise go quiet.
+#
+# Why not just pass 1 Hz straight through: SubMaster.alive is
+# (now - last_recv) < 10 / declared_freq, and services.py declares this topic at 10 Hz,
+# giving a 1.0 s window. Measured 0x463 spacing on this car is min 0.974 / median 0.991 /
+# max 1.030 s -- 34% of intervals exceed 1.0 s, which would leave `alive` false ~1% of the
+# time. One consumer cares: hardwared.py builds the server STATUS_PACKET with
+# `location if sm.alive[...] else None`, so a passthrough would occasionally report no
+# position at all.
+#
+# Why not a free-running cadence: a fresh fix would then wait up to a full publish period
+# before anyone saw it, adding latency on top of the ~0.47 s the whole-second UTC encoding
+# already costs us. Latency is a systematic along-track position error, which matters more
+# for map matching than the duplicate count does.
+KEEPALIVE_INTERVAL = 0.5
+
+
+def should_publish(fresh_fix: bool, now: float, last_publish: float) -> bool:
+  """Publish on a fresh 0x463, else once the topic is about to go stale.
+
+  With CAN at ~1 Hz and a 0.5 s keepalive the repeat fires every cycle, so this is
+  ~2 Hz in practice -- one fresh sample and one held repeat per second. The point is
+  not the conditional (it is effectively unconditional at this source rate) but the
+  phase: fresh data goes out on arrival instead of waiting for the next tick.
+  """
+  if fresh_fix:
+    return True
+  return (now - last_publish) >= KEEPALIVE_INTERVAL
 
 
 def decode_utc(vl: dict) -> datetime.datetime | None:
@@ -214,24 +237,25 @@ def main() -> NoReturn:
   had_fix = False
 
   rk = Ratekeeper(10, print_delay_threshold=None)
-  tick = 0
+  last_publish = now - KEEPALIVE_INTERVAL
   while True:
+    fresh_fix = False
     can_strs = messaging.drain_sock_raw(can_sock, wait_for_one=False)
+    now = time.monotonic()
     if can_strs:
       updated = cp.update(can_capnp_to_list(can_strs))
-      now = time.monotonic()
       if GPS_ADDR_POS in updated:
         last_seen_pos = now
       if GPS_ADDR_TIME in updated:
         last_seen_time = now
+        fresh_fix = True
         utc = decode_utc(cp.vl[GPS_ADDR_TIME])
         if utc is not None:
           last_utc = utc
           last_utc_monotonic = now
 
-    tick += 1
-    if tick % PUBLISH_EVERY_N_TICKS == 0:
-      now = time.monotonic()
+    if should_publish(fresh_fix, now, last_publish):
+      last_publish = now
       time_fresh = (now - last_seen_time) < MAX_FIX_AGE
       pos_fresh = (now - last_seen_pos) < MAX_FIX_AGE
       position = decode_position(cp.vl[GPS_ADDR_POS])
