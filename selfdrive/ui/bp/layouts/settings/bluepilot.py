@@ -59,6 +59,14 @@ class BluePilotLayout(Widget):
     than leaving a live-looking control that silently does nothing."""
     return ui_state.CP is None or ui_state.CP.carFingerprint != "FORD_EDGE_MK2"
 
+  @staticmethod
+  def _ford_vehicle_gps_supported() -> bool:
+    """cangpsd only reads GPS off CAN on Ford vehicles -- grey out the toggle on other
+    brands rather than leaving a live-looking control that silently does nothing. CP is
+    None until a car is seen, and settings are usually opened offroad, so allow that case
+    or the toggle can never be turned on in the garage."""
+    return ui_state.CP is None or ui_state.CP.brand == "ford"
+
   def __init__(self):
     super().__init__()
     self._params = Params()
@@ -90,6 +98,7 @@ class BluePilotLayout(Widget):
       ("BPAnimateSteeringWheel", self._animate_steering_wheel),
       ("BPUseCustomSounds", self._use_custom_sounds),
       ("FordPrefShowRadarLeadOverlay", self._show_ford_radar_overlay),
+      ("FordPrefUseVehicleGps", self._use_vehicle_gps),
       ("FordPrefHybridBatteryStatus", self._show_hybrid_battery_status),
       ("FordPrefHybridPowerFlow", self._show_hybrid_power_flow),
       ("enable_human_turn_detection_curv", self._enable_human_turn_detection),
@@ -275,6 +284,17 @@ class BluePilotLayout(Widget):
       initial_state=self._safe_get_bool(self._params, "FordPrefShowRadarLeadOverlay"),
       callback=lambda state: self._toggle_callback(state, "FordPrefShowRadarLeadOverlay"),
       icon="speed_limit.png"
+    )
+
+    # Ford CAN GPS toggle (windshield blocks device GPS on some vehicles)
+    self._use_vehicle_gps = toggle_item(
+      lambda: tr("Use Vehicle GPS (Ford)"),
+      lambda: tr("Read GPS position and time from the vehicle over CAN instead of the device's built-in GPS receiver. "
+                 "Useful when the windshield blocks the device's GPS. Takes effect on the next drive."),
+      initial_state=self._safe_get_bool(self._params, "FordPrefUseVehicleGps"),
+      callback=lambda state: self._toggle_callback(state, "FordPrefUseVehicleGps"),
+      icon="speed_limit.png",
+      enabled=self._ford_vehicle_gps_supported,
     )
 
     # Ford radar overlay size selector (inline buttons like Driving Personality)
@@ -690,6 +710,7 @@ class BluePilotLayout(Widget):
       _section(tr("Vehicle"), [
         self._show_hands_free_ui,
         self._steer_angle_curvature,
+        self._use_vehicle_gps,
         self._vbatt_pause_charging,
       ]) +
       _section(tr("Audio"), [

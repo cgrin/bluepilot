@@ -32,11 +32,17 @@ def logging(started: bool, params: Params, CP: car.CarParams) -> bool:
 def ublox_available() -> bool:
   return os.path.exists('/dev/ttyHS0') and not os.path.exists('/persist/comma/use-quectel-gps')
 
+def ford_can_gps(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and CP.brand == "ford" and params.get_bool("FordPrefUseVehicleGps")
+
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
   use_ublox = ublox_available()
   if use_ublox != params.get_bool("UbloxAvailable"):
     params.put_bool("UbloxAvailable", use_ublox, block=True)
-  return started and use_ublox
+  # Gate only the ubloxd/pigeond process start here; the UbloxAvailable param above stays driven
+  # by raw ublox_available() so gpsLocationExternal/gpsLocation routing (common/gps.py,
+  # locationd.cc) is unaffected by whether cangpsd is providing GPS instead.
+  return started and use_ublox and not ford_can_gps(started, params, CP)
 
 def joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("JoystickDebugMode")
@@ -199,6 +205,7 @@ if is_bluepilot():
   procs += [
     PythonProcess("bp_portal", "bluepilot.backend.bp_portal", _bp_portal_enabled),
     PythonProcess("bp_route_preprocessor", "bluepilot.backend.routes.preprocessor", _bp_route_preprocessor_enabled),
+    PythonProcess("cangpsd", "bluepilot.system.cangpsd", ford_can_gps, enabled=TICI),
   ]
 
 if os.path.exists("./github_runner.sh"):

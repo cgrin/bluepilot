@@ -320,6 +320,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"show_lead_speed", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"FordPrefSteerAngleCurvature", {PERSISTENT | BACKUP, BOOL, "0"}},  // pinion-sourced curvature measurement (bad-yaw-sensor workaround); read at car init
     {"FordPrefShowRadarLeadOverlay", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"FordPrefUseVehicleGps", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"FordPrefRadarOverlaySize", {PERSISTENT | BACKUP, INT, "1"}},
     {"FordPrefHybridBatteryStatus", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"FordPrefHybridPowerFlow", {PERSISTENT | BACKUP, BOOL, "0"}},
