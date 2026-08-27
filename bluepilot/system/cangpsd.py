@@ -82,6 +82,15 @@ CP_CHECK_INTERVAL = 1.0
 # have 0x463 never emits a position-only sample on the way up.
 NO_TIME_GRACE = 5.0
 
+# Stand-ins for "the car never told us", used when 0x464 is absent or reports a sentinel.
+# 5.8 is the DBC's maximum hdop/vdop and 5.0 the nominal metres of error per dop unit, so
+# 30 m is a hair past the worst accuracy the signal is capable of expressing. Bearing gets
+# 180 deg (any direction) and speed 50 m/s (any road speed) -- both saturated rather than
+# invented, since there is no honest middle value.
+UNKNOWN_ACCURACY = 30.0
+UNKNOWN_SPEED_ACCURACY = 50.0
+UNKNOWN_BEARING_ACCURACY = 180.0
+
 
 def should_publish(fresh_fix: bool, now: float, last_publish: float) -> bool:
   """Publish on a fresh 0x463, else once the topic is about to go stale.
@@ -167,52 +176,79 @@ def decode_position(vl: dict) -> tuple[float, float, int, int] | None:
   return lat, lon, hemi_lat_raw, hemi_lon_raw
 
 
-def decode_quality(vl: dict) -> dict:
-  """Decode the secondary fix-quality fields out of 0x464.
+# Everything 0x464 carries, with nothing known about any of it. Used when the car does not
+# send 0x464 at all (Focus MK4 sends 0x462 and nothing else) and before the first frame.
+QUALITY_UNKNOWN: dict = {"altitude": None, "speed": None, "bearing_deg": None,
+                         "hdop": None, "vdop": None, "sat_count": 0}
 
-  Not part of the hasFix gate (only 0x462/0x463 freshness and validity are),
-  but used to fill in the rest of the published message.
+
+def decode_quality(vl: dict) -> dict:
+  """Decode the secondary fix-quality fields out of 0x464, None for anything unusable.
+
+  Not part of the hasFix gate (only 0x462/0x463 freshness and validity are), but used to
+  fill in the rest of the published message. Every field here has Unknown/Invalid/Fault
+  sentinels in the DBC, and a sentinel passed through the scale factor becomes a plausible
+  reading -- GPS_Speed 255 would publish as 114 m/s. None of them fire on the Mach-E (722
+  frames across routes 0x10b and 0x10c: only GPS_Sat_num_in_view, constantly), so this is
+  guarding a latent case rather than an observed one.
   """
+  def valid(sig: str, scale: float, offset: float, *sentinels: int) -> float | None:
+    raw = round((vl[sig] - offset) / scale)
+    return None if raw in sentinels else vl[sig]
+
+  # GPS_Sat_num_in_view is a 5-bit field the DBC bounds at [0|29], so 30/31 are
+  # sentinels. Verified against routes 0x101, 0x106 and 0xf1: this car reports a
+  # constant 31 even while stationary with PDOP 0.6, i.e. it never populates the
+  # count at all. Report 0 (unknown) rather than a fabricated 31 satellites.
   sat_count = int(vl["GPS_Sat_num_in_view"])
+  altitude = valid("GPS_MSL_altitude", 10, -20460, 4094, 4095)
+  speed = valid("GPS_Speed", 1, 0, 254, 255)
   return {
     # GPS_MSL_altitude is geoid height (mean sea level); GpsLocationData.altitude
     # is documented as WGS84 ellipsoid height. The two differ by ~35 m in Seattle.
     # Accepted uncorrected -- we have no geoid model on the device.
-    "altitude": vl["GPS_MSL_altitude"] * 0.3048,
-    "speed": vl["GPS_Speed"] * 0.44704,
-    "bearing_deg": vl["GPS_Heading"],
-    "hdop": vl["GPS_Hdop"],
-    "vdop": vl["GPS_Vdop"],
-    # GPS_Sat_num_in_view is a 5-bit field the DBC bounds at [0|29], so 30/31 are
-    # sentinels. Verified against routes 0x101, 0x106 and 0xf1: this car reports a
-    # constant 31 even while stationary with PDOP 0.6, i.e. it never populates the
-    # count at all. Report 0 (unknown) rather than a fabricated 31 satellites.
+    "altitude": None if altitude is None else altitude * 0.3048,
+    "speed": None if speed is None else speed * 0.44704,
+    "bearing_deg": valid("GPS_Heading", 0.01, 0, 65534, 65535),
+    "hdop": valid("GPS_Hdop", 0.2, 0, 30, 31),
+    "vdop": valid("GPS_Vdop", 0.2, 0, 30, 31),
     "sat_count": sat_count if sat_count <= 29 else 0,
   }
 
 
-def build_gps_msg(lat: float, lon: float, altitude: float, speed: float, bearing_deg: float,
-                   unix_timestamp_millis: int, hdop: float, vdop: float, sat_count: int,
+def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float | None,
+                   bearing_deg: float | None, unix_timestamp_millis: int, hdop: float | None,
+                   vdop: float | None, sat_count: int,
                    has_fix: bool) -> capnp.lib.capnp._DynamicStructBuilder:
-  """Build a gpsLocationExternal message from already-decoded plain values."""
+  """Build a gpsLocationExternal message from already-decoded plain values.
+
+  A None means the car never told us. GpsLocationData has no way to say "unknown" for a
+  value, only an accuracy alongside it, so the value goes out as 0 and the matching
+  accuracy is widened to cover the whole plausible range. That is the difference between
+  publishing 0 m/s because the car is stopped and publishing 0 m/s because we have no idea
+  -- a consumer that reads accuracy can tell them apart, and one that ignores accuracy is
+  no worse off than it would be with a fabricated number.
+  """
   msg = messaging.new_message('gpsLocationExternal', valid=True)
   gps = msg.gpsLocationExternal
   gps.latitude = lat
   gps.longitude = lon
-  gps.altitude = altitude
-  gps.speed = speed
-  gps.bearingDeg = bearing_deg
+  gps.altitude = altitude if altitude is not None else 0.0
+  gps.speed = speed if speed is not None else 0.0
+  gps.bearingDeg = bearing_deg if bearing_deg is not None else 0.0
   gps.unixTimestampMillis = unix_timestamp_millis
   gps.source = log.GpsLocationData.SensorSource.car
-  bearing_rad = math.radians(bearing_deg)
-  gps.vNED = [speed * math.cos(bearing_rad), speed * math.sin(bearing_rad), 0.0]
+  bearing_rad = math.radians(gps.bearingDeg)
+  gps.vNED = [gps.speed * math.cos(bearing_rad), gps.speed * math.sin(bearing_rad), 0.0]
   # locationd.cc discards the message outright unless all three accuracies are
   # positive, so these are clamped to a nominal floor rather than left at raw
   # (possibly zero, e.g. before the first 0x464 frame) hdop/vdop.
-  gps.horizontalAccuracy = max(1.0, hdop * 5.0)  # 5 m nominal UERE per dop unit
-  gps.verticalAccuracy = max(1.0, vdop * 5.0)
-  gps.speedAccuracy = 0.5
-  gps.bearingAccuracyDeg = 5.0
+  # The DBC caps hdop/vdop at 5.8, so UNKNOWN_ACCURACY is one step past the worst the car
+  # could have reported -- "no better than anything expressible", not an invented number.
+  gps.horizontalAccuracy = max(1.0, hdop * 5.0) if hdop is not None else UNKNOWN_ACCURACY
+  gps.verticalAccuracy = max(1.0, vdop * 5.0) if vdop is not None else UNKNOWN_ACCURACY
+  gps.speedAccuracy = 0.5 if speed is not None else UNKNOWN_SPEED_ACCURACY
+  gps.bearingAccuracyDeg = 5.0 if bearing_deg is not None else UNKNOWN_BEARING_ACCURACY
   gps.hasFix = has_fix
   gps.satelliteCount = sat_count
   return msg
@@ -301,6 +337,7 @@ def main() -> NoReturn:
   now = time.monotonic()
   last_seen_pos = 0.0
   last_seen_time = 0.0
+  last_seen_quality = 0.0
   first_seen_pos = 0.0
   # has this car ever sent a 0x463? distinguishes "waiting for the first one" from
   # "this platform does not have the message at all" -- see NO_TIME_GRACE
@@ -338,7 +375,7 @@ def main() -> NoReturn:
           cp = make_parser(dbc_name, can_bus)
           # everything decoded so far came off the wrong bus, including the evidence
           # about whether this platform has a time message at all
-          last_seen_pos = last_seen_time = first_seen_pos = 0.0
+          last_seen_pos = last_seen_time = last_seen_quality = first_seen_pos = 0.0
           last_utc = None
           ever_saw_time = False
 
@@ -350,6 +387,8 @@ def main() -> NoReturn:
         fresh_pos = True
         if first_seen_pos == 0.0:
           first_seen_pos = now
+      if GPS_ADDR_QUALITY in updated:
+        last_seen_quality = now
       if GPS_ADDR_TIME in updated:
         last_seen_time = now
         ever_saw_time = True
@@ -405,7 +444,10 @@ def main() -> NoReturn:
       # indistinguishable on the wire from a receiver that is present and failing.
       if ever_had_fix:
         lat, lon = (position[0], position[1]) if position is not None else (0.0, 0.0)
-        quality = decode_quality(cp.vl[GPS_ADDR_QUALITY])
+        # Covers both "this car has no 0x464" (Focus MK4) and "0x464 has gone quiet":
+        # stale altitude/speed/bearing are worse than admitting we do not know.
+        quality_fresh = (now - last_seen_quality) < MAX_FIX_AGE
+        quality = decode_quality(cp.vl[GPS_ADDR_QUALITY]) if quality_fresh else QUALITY_UNKNOWN
         msg = build_gps_msg(lat, lon, quality["altitude"], quality["speed"], quality["bearing_deg"],
                              publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix)
         pm.send('gpsLocationExternal', msg)
