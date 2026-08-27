@@ -128,6 +128,22 @@ class TestDecodePosition:
   def test_out_of_range_rejected(self, over):
     assert decode_position(with_(GOOD_POS, **over)) is None
 
+  @pytest.mark.parametrize("field,value", [
+    ("GPS_Latitude_Minutes", 62),      # Unknown
+    ("GPS_Latitude_Minutes", 63),      # Fault
+    ("GPS_Longitude_Minutes", 62),     # Unknown
+    ("GPS_Longitude_Minutes", 63),     # Fault
+    ("GPS_Latitude_Min_dec", 1.6382),  # raw 16382, Unknown
+    ("GPS_Latitude_Min_dec", 1.6383),  # raw 16383, Invalid
+    ("GPS_Longitude_Min_dec", 1.6382),  # raw 16382, Unknown
+    ("GPS_Longitude_Min_dec", 1.6383),  # raw 16383, Invalid
+  ])
+  def test_minutes_sentinel_rejected(self, field, value):
+    # Unlike the degrees sentinels, these land inside a plausible minutes range once
+    # scaled -- e.g. GPS_Latitude_Minutes 63 reads as a legal 63 minutes, not caught by
+    # the |lat| > 90 check. Worth up to ~120 km of silent error if not rejected explicitly.
+    assert decode_position(with_(GOOD_POS, **{field: value})) is None
+
   def test_hemisphere_enums_passed_through_unused(self):
     # Returned so an offline decoder can surface them if another vehicle disagrees, but
     # they must not influence the sign -- this car reports 2/2 (north+west) always.
@@ -224,6 +240,14 @@ class TestBuildGpsMsg:
 
   def test_unknown_altitude_is_zero(self):
     assert self.build(altitude=None).altitude == 0.0
+
+  def test_unknown_altitude_widens_vertical_accuracy(self):
+    # The bug this guards: a missing GPS_MSL_altitude published as altitude=0.0 above, but
+    # a valid vdop still scaled verticalAccuracy to a tight value -- a confident sea-level
+    # reading manufactured out of "we don't know". altitude=None must widen it regardless
+    # of vdop, the same way speed=None/bearing_deg=None widen their own accuracies.
+    gps = self.build(altitude=None, vdop=0.8)
+    assert gps.verticalAccuracy == pytest.approx(UNKNOWN_ACCURACY)
 
   def test_whole_unknown_quality_dict_builds(self):
     gps = build_gps_msg(47.6, -122.3, **{k: QUALITY_UNKNOWN[k] for k in

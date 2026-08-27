@@ -32,6 +32,7 @@ from opendbc.car.ford.values import DBC
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.pandad import can_capnp_to_list
 
 # APIMGPS_Data_Nav_1_FD1: lat/lon degrees+minutes and hemisphere enums
@@ -67,9 +68,9 @@ CP_CHECK_INTERVAL = 1.0
 
 # Only the CAN FD Ford platforms broadcast 0x463; the classic-CAN ones (Escape MK4,
 # Explorer MK6, Focus MK4, Maverick MK1, Bronco Sport MK1) send 0x462 and mostly 0x464 but
-# never the time message. Measured over 6 spread-sampled public segments per platform from
-# commaCarSegments: 0x463 had zero frames on all 30 classic-CAN segments and full 1 Hz
-# coverage on every CAN FD one.
+# never the time message. This split holds across every public segment measured so far,
+# both a first spot-check and a later, broader run across more platforms -- see
+# bluepilot/system/CANGPS_PLATFORMS.md for the measurement detail and counts.
 #
 # Position is worth publishing on its own -- mapd, speed limits, athenad and the UI all
 # want lat/lon and none of them read unixTimestampMillis (timed.py is its only real
@@ -154,7 +155,21 @@ def decode_position(vl: dict) -> tuple[float, float, int, int] | None:
   Both hemisphere enums read a constant 2 on every sample, north+west, so they
   are not a south/east boolean pair. Left unused; still returned so the offline
   decoder can surface them if another vehicle disagrees.
+
+  The degrees sentinels (raw 254/255 on GPS_Latitude_Degrees, decoded 165/166) are caught
+  for free by the |lat| > 90 check below. The minutes sentinels are not: GPS_Latitude/
+  Longitude_Minutes raw 62 Unknown/63 Fault (scale 1) and _Min_dec raw 16382 Unknown/16383
+  Invalid (scale 0.0001) all land inside a plausible minutes range, worth up to 1.077 deg
+  (~120 km) of silent error if passed through. Checked explicitly, mirroring decode_quality.
   """
+  def is_sentinel(sig: str, scale: float, *sentinels: int) -> bool:
+    return round(vl[sig] / scale) in sentinels
+
+  if (is_sentinel("GPS_Latitude_Minutes", 1, 62, 63) or is_sentinel("GPS_Longitude_Minutes", 1, 62, 63)
+      or is_sentinel("GPS_Latitude_Min_dec", 0.0001, 16382, 16383)
+      or is_sentinel("GPS_Longitude_Min_dec", 0.0001, 16382, 16383)):
+    return None
+
   lat_deg = vl["GPS_Latitude_Degrees"]
   lat_min = vl["GPS_Latitude_Minutes"] + vl["GPS_Latitude_Min_dec"]
   lon_deg = vl["GPS_Longitude_Degrees"]
@@ -247,7 +262,10 @@ def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float |
   # The DBC caps hdop/vdop at 5.8, so UNKNOWN_ACCURACY is one step past the worst the car
   # could have reported -- "no better than anything expressible", not an invented number.
   gps.horizontalAccuracy = max(1.0, hdop * 5.0) if hdop is not None else UNKNOWN_ACCURACY
-  gps.verticalAccuracy = max(1.0, vdop * 5.0) if vdop is not None else UNKNOWN_ACCURACY
+  # verticalAccuracy has to widen on an unknown altitude too, not just an unknown vdop --
+  # otherwise a missing GPS_MSL_altitude (published as 0.0 above) pairs with a valid vdop
+  # to publish a confident sea-level reading. Speed/bearing below already couple this way.
+  gps.verticalAccuracy = max(1.0, vdop * 5.0) if (vdop is not None and altitude is not None) else UNKNOWN_ACCURACY
   gps.speedAccuracy = 0.5 if speed is not None else UNKNOWN_SPEED_ACCURACY
   gps.bearingAccuracyDeg = 5.0 if bearing_deg is not None else UNKNOWN_BEARING_ACCURACY
   gps.hasFix = has_fix
@@ -391,11 +409,18 @@ def main() -> NoReturn:
       if GPS_ADDR_QUALITY in updated:
         last_seen_quality = now
       if GPS_ADDR_TIME in updated:
-        last_seen_time = now
+        # ever_saw_time and fresh_fix key off the frame arriving at all -- a faulted 0x463
+        # still proves this platform has the message, which is what NO_TIME_GRACE and the
+        # publish phase-lock care about. last_seen_time is different: it feeds MAX_FIX_AGE,
+        # which is supposed to age out a fix that has gone bad. Real Mach-E logs show ~3 in
+        # 240 0x463 frames failing decode_utc (a transient Gps_B_Falt/PDOP sentinel), so
+        # advancing last_seen_time here regardless of decode result would let a sustained
+        # fault hold hasFix true forever even though decode_utc keeps rejecting every sample.
         ever_saw_time = True
         fresh_fix = True
         utc = decode_utc(cp.vl[GPS_ADDR_TIME])
         if utc is not None:
+          last_seen_time = now
           last_utc = utc
           last_utc_monotonic = now
 
@@ -423,12 +448,16 @@ def main() -> NoReturn:
         publish_millis = int((last_utc.timestamp() + (now - last_utc_monotonic)) * 1000)
       elif no_time_source:
         # No GPS time exists on this car, and unixTimestampMillis has no "unknown" value.
-        # Publishing the system clock keeps timed.py inert -- the diff is ~0, so set_time
-        # returns on "Time diff too small", and if the clock is still at the AGNOS flash
-        # date it fails min_date() instead. Neither path feeds back into us, so the
-        # circularity that rules out time.time() on a car with real GPS time cannot arise
-        # here: there is no GPS time for timed to have set the clock from.
-        publish_millis = int(time.time() * 1000)  # noqa: TID251
+        # There is no circularity in reading time.time() here the way there would be on a
+        # car with real GPS time: timed.py only ever steps the clock off a fix *we*
+        # published, and on this platform we never publish a GPS-derived time, so there is
+        # nothing for it to have fed back to us. system_time_valid() makes the two outcomes
+        # explicit instead of leaning on a coincidence in another module: clock already set
+        # (by NTP, or a previous boot's timed run) -> publish the real time, so mapd and
+        # friends get a correct timestamp; clock still at the AGNOS flash date -> publish 0
+        # (1970), which unconditionally fails timed.py's min_date() check rather than
+        # relying on the diff-vs-flash-date arithmetic happening to come out too small.
+        publish_millis = int(time.time() * 1000) if system_time_valid() else 0  # noqa: TID251
       # else: 0x463 has gone stale -- freeze publish_millis and report no fix,
       # but keep publishing so SubMaster.alive stays true for consumers
 
