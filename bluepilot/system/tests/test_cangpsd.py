@@ -15,10 +15,14 @@ import pytest
 
 from openpilot.bluepilot.system.cangpsd import (
   KEEPALIVE_INTERVAL,
+  MAX_FIX_AGE,
+  NO_TIME_GRACE,
   QUALITY_UNKNOWN,
   UNKNOWN_ACCURACY,
   UNKNOWN_BEARING_ACCURACY,
   UNKNOWN_SPEED_ACCURACY,
+  FixTracker,
+  TimeSource,
   build_gps_msg,
   decode_position,
   decode_quality,
@@ -273,3 +277,141 @@ class TestShouldPublish:
     # services.py declares gpsLocationExternal at 10 Hz and SubMaster.alive is
     # (now - last_recv) < 10/freq, so the topic must not go quiet for a whole second.
     assert KEEPALIVE_INTERVAL < 1.0
+
+
+UTC0 = datetime.datetime(2026, 8, 27, 0, 33, 45, tzinfo=datetime.UTC)
+UTC0_MILLIS = int(UTC0.timestamp() * 1000)
+
+
+class TestFixTracker:
+  """Freshness, grace and phase-lock rules, driven by hand-advanced monotonic time."""
+
+  @staticmethod
+  def locked(now: float = 100.0) -> FixTracker:
+    # a tracker that has just seen a good position and a good time
+    fix = FixTracker()
+    fix.observe_position(now)
+    fix.observe_time(now, UTC0)
+    return fix
+
+  def test_no_fix_before_any_frame(self):
+    fix = FixTracker()
+    assert not fix.has_fix(100.0, position_valid=True)
+    assert fix.time_source(100.0) == TimeSource.UNKNOWN
+
+  def test_fix_needs_both_time_and_position(self):
+    fix = FixTracker()
+    fix.observe_time(100.0, UTC0)
+    assert not fix.has_fix(100.0, position_valid=True)  # no 0x462 yet
+    fix.observe_position(100.0)
+    assert fix.has_fix(100.0, position_valid=True)
+    assert not fix.has_fix(100.0, position_valid=False)  # 0x462 arrived but decoded to a sentinel
+
+  def test_fix_ages_out(self):
+    fix = self.locked(100.0)
+    assert fix.has_fix(100.0 + MAX_FIX_AGE - 0.1, position_valid=True)
+    assert not fix.has_fix(100.0 + MAX_FIX_AGE, position_valid=True)
+
+  def test_stale_position_alone_loses_fix(self):
+    fix = self.locked(100.0)
+    fix.observe_time(100.0 + MAX_FIX_AGE, UTC0)  # time keeps coming, position stopped
+    assert not fix.has_fix(100.0 + MAX_FIX_AGE, position_valid=True)
+
+  def test_faulted_time_frame_does_not_extend_fix(self):
+    # ~3 in 240 real 0x463 frames fail decode_utc. A sustained run of them must not hold
+    # hasFix open: the frame arriving is not evidence that the clock is still good.
+    fix = self.locked(100.0)
+    for t in range(101, 106):
+      fix.observe_position(float(t))
+      fix.observe_time(float(t), None)
+    assert not fix.has_fix(105.0, position_valid=True)
+
+  def test_faulted_time_frame_still_proves_platform_has_time(self):
+    # ...but it does settle the platform question, so we never fall through to the
+    # position-only mode on a car that has 0x463 and is merely faulting.
+    fix = FixTracker()
+    fix.observe_position(100.0)
+    fix.observe_time(100.0, None)
+    assert fix.time_source(100.0 + NO_TIME_GRACE + 10) == TimeSource.CAN
+    assert not fix.has_fix(100.0 + NO_TIME_GRACE + 10, position_valid=True)
+
+  def test_position_only_platform_after_grace(self):
+    fix = FixTracker()
+    fix.observe_position(100.0)
+    before = 100.0 + NO_TIME_GRACE - 0.1
+    after = 100.0 + NO_TIME_GRACE
+    fix.observe_position(before)
+    assert fix.time_source(before) == TimeSource.UNKNOWN
+    assert not fix.has_fix(before, position_valid=True)  # silent until the grace expires
+    fix.observe_position(after)
+    assert fix.time_source(after) == TimeSource.NONE
+    assert fix.has_fix(after, position_valid=True)
+
+  def test_grace_is_measured_from_first_position_not_boot(self):
+    fix = FixTracker()
+    assert fix.time_source(1000.0) == TimeSource.UNKNOWN  # no 0x462 either: nothing to time against
+    fix.observe_position(1000.0)
+    assert fix.time_source(1000.0 + NO_TIME_GRACE - 0.1) == TimeSource.UNKNOWN
+
+  def test_late_time_frame_flips_position_only_back_to_can(self):
+    fix = FixTracker()
+    fix.observe_position(100.0)
+    t = 100.0 + NO_TIME_GRACE
+    assert fix.time_source(t) == TimeSource.NONE
+    fix.observe_time(t, UTC0)
+    assert fix.time_source(t) == TimeSource.CAN
+
+  def test_timestamp_advances_by_monotonic_elapsed(self):
+    fix = self.locked(100.0)
+    assert fix.timestamp_millis(100.0, wall_millis=0) == UTC0_MILLIS
+    assert fix.timestamp_millis(101.5, wall_millis=0) == UTC0_MILLIS + 1500
+
+  def test_timestamp_freezes_when_time_goes_stale(self):
+    fix = self.locked(100.0)
+    fix.timestamp_millis(102.0, wall_millis=0)
+    frozen = fix.timestamp_millis(100.0 + MAX_FIX_AGE, wall_millis=0)
+    assert frozen == UTC0_MILLIS + 2000  # last value held, not advanced and not zeroed
+    assert fix.timestamp_millis(100.0 + MAX_FIX_AGE + 60, wall_millis=0) == frozen
+
+  def test_timestamp_ignores_wall_clock_on_can_platform(self):
+    # a wrong wall clock must never leak into a GPS-timed sample -- that is the
+    # circularity with timed.py
+    fix = self.locked(100.0)
+    assert fix.timestamp_millis(100.0, wall_millis=123456789) == UTC0_MILLIS
+
+  @pytest.mark.parametrize("wall_millis", [0, 1_780_000_000_000])
+  def test_position_only_platform_publishes_wall_clock(self, wall_millis):
+    fix = FixTracker()
+    fix.observe_position(100.0)
+    t = 100.0 + NO_TIME_GRACE
+    assert fix.timestamp_millis(t, wall_millis=wall_millis) == wall_millis
+
+  def test_fresh_fix_phase_locks_to_time_frame(self):
+    fix = self.locked(100.0)
+    assert fix.fresh_fix(100.0, fresh_time=True, fresh_pos=False)
+    assert not fix.fresh_fix(100.0, fresh_time=False, fresh_pos=True)  # 0x462 alone: wait for keepalive
+    assert not fix.fresh_fix(100.0, fresh_time=False, fresh_pos=False)
+
+  def test_fresh_fix_phase_locks_to_position_frame_without_time_source(self):
+    fix = FixTracker()
+    fix.observe_position(100.0)
+    t = 100.0 + NO_TIME_GRACE
+    assert fix.fresh_fix(t, fresh_time=False, fresh_pos=True)
+
+  def test_quality_freshness_is_independent(self):
+    fix = self.locked(100.0)
+    assert not fix.quality_fresh(100.0)  # never saw 0x464
+    fix.observe_quality(100.0)
+    assert fix.quality_fresh(100.0 + MAX_FIX_AGE - 0.1)
+    assert not fix.quality_fresh(100.0 + MAX_FIX_AGE)
+
+  def test_reset_forgets_bus_evidence_but_keeps_frozen_timestamp(self):
+    fix = self.locked(100.0)
+    fix.observe_quality(100.0)
+    fix.timestamp_millis(100.0, wall_millis=0)
+    fix.reset()
+    assert fix.time_source(100.0) == TimeSource.UNKNOWN
+    assert not fix.has_fix(100.0, position_valid=True)
+    assert not fix.quality_fresh(100.0)
+    # the published clock is not evidence about the bus; it stays held like any stale sample
+    assert fix.timestamp_millis(100.0, wall_millis=0) == UTC0_MILLIS
