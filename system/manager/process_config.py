@@ -1,9 +1,12 @@
+import functools
 import os
 import operator
 import platform
 
+import cereal.messaging as messaging
 from cereal import car, custom
 from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 from openpilot.common.bluepilot import is_bluepilot
 from openpilot.system.hardware import PC, TICI
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
@@ -32,8 +35,34 @@ def logging(started: bool, params: Params, CP: car.CarParams) -> bool:
 def ublox_available() -> bool:
   return os.path.exists('/dev/ttyHS0') and not os.path.exists('/persist/comma/use-quectel-gps')
 
+@functools.cache
+def prev_route_brand() -> str:
+  """The car brand recorded on the previous drive, or "" if there isn't one.
+
+  manager evaluates process gates against the live `carParams` message, which card only
+  publishes once it has fingerprinted the car -- about six seconds into a boot. Any gate
+  that keys off the brand is therefore wrong for those six seconds, which is long enough
+  for ubloxd/pigeond to start, claim gpsLocationExternal, and be killed again.
+  CarParamsPersistent is written by card on every drive and survives reboots, so on any
+  boot after the first in a given car it supplies the brand immediately.
+
+  Cached for the life of the process: card is the only writer, and by the time it has run
+  the live CP is available and takes precedence below anyway.
+  """
+  cp_bytes = Params().get("CarParamsPersistent")
+  if cp_bytes is None:
+    return ""
+  try:
+    return messaging.log_from_bytes(cp_bytes, car.CarParams).brand
+  except Exception:
+    cloudlog.exception("process_config: failed to deserialize CarParamsPersistent")
+    return ""
+
 def ford_can_gps(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and CP.brand == "ford" and params.get_bool("FordPrefUseVehicleGps")
+  # Prefer the live CP; fall back to the last drive's brand only while card is still
+  # fingerprinting, so ubloxd never gets a head start on the topic cangpsd is about to own.
+  brand = CP.brand or prev_route_brand()
+  return started and brand == "ford" and params.get_bool("FordPrefUseVehicleGps")
 
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
   use_ublox = ublox_available()
