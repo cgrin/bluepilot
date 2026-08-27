@@ -6,9 +6,10 @@ IR-reflective windshield blocks the antenna and there's no uncoated zone to
 mount in. The car itself broadcasts a full GPS solution on CAN bus 0 at
 ~1 Hz (APIMGPS_Data_Nav_1/2/3_FD1, DBC ford_lincoln_base_pt.dbc). This daemon
 decodes it and republishes gpsLocationExternal so system/timed.py,
-locationd_llk, speed_limit_resolver.py, mapd, and athenad all keep working
-unmodified. ubloxd is gated off elsewhere so msgq's one-publisher-per-topic
-rule doesn't collide.
+selfdrived.py, speed_limit_resolver.py, mapd, and athenad all keep working
+unmodified (locationd in this tree is camera+IMU only and never reads GPS).
+ubloxd is gated off elsewhere so msgq's one-publisher-per-topic rule doesn't
+collide.
 
 Decode is split into pure functions (decode_utc, decode_position,
 decode_quality) that take plain dicts of already-scaled DBC signal values, so
@@ -256,9 +257,10 @@ def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float |
   gps.source = log.GpsLocationData.SensorSource.car
   bearing_rad = math.radians(gps.bearingDeg)
   gps.vNED = [gps.speed * math.cos(bearing_rad), gps.speed * math.sin(bearing_rad), 0.0]
-  # locationd.cc discards the message outright unless all three accuracies are
-  # positive, so these are clamped to a nominal floor rather than left at raw
-  # (possibly zero, e.g. before the first 0x464 frame) hdop/vdop.
+  # Kept strictly positive: nothing in this tree filters on accuracy today (locationd
+  # does not read GPS here), but upstream's locationd discards a sample whose accuracies
+  # are not all > 0, so a nominal floor keeps the message usable by any such consumer
+  # rather than leaving it at raw (possibly zero, e.g. before the first 0x464) hdop/vdop.
   # The DBC caps hdop/vdop at 5.8, so UNKNOWN_ACCURACY is one step past the worst the car
   # could have reported -- "no better than anything expressible", not an invented number.
   gps.horizontalAccuracy = max(1.0, hdop * 5.0) if hdop is not None else UNKNOWN_ACCURACY

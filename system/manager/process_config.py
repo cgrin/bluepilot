@@ -61,8 +61,11 @@ def prev_route_brand() -> str:
 def ford_can_gps(started: bool, params: Params, CP: car.CarParams) -> bool:
   # Prefer the live CP; fall back to the last drive's brand only while card is still
   # fingerprinting, so ubloxd never gets a head start on the topic cangpsd is about to own.
+  # Only meaningful on ublox devices: with a Quectel modem, UbloxAvailable is False and every
+  # consumer reads gpsLocation (qcomgpsd) instead, so publishing gpsLocationExternal would
+  # reach nobody. Gating here keeps the toggle from starting a daemon that does nothing.
   brand = CP.brand or prev_route_brand()
-  return started and brand == "ford" and params.get_bool("FordPrefUseVehicleGps")
+  return started and ublox_available() and brand == "ford" and params.get_bool("FordPrefUseVehicleGps")
 
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
   use_ublox = ublox_available()

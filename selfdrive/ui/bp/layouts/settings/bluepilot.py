@@ -290,7 +290,7 @@ class BluePilotLayout(Widget):
     self._use_vehicle_gps = toggle_item(
       lambda: tr("Use Vehicle GPS (Ford)"),
       lambda: tr("Read GPS position and time from the vehicle over CAN instead of the device's built-in GPS receiver. "
-                 "Useful when the windshield blocks the device's GPS. Takes effect on the next drive."),
+                 + "Useful when the windshield blocks the device's GPS. Takes effect immediately, even while driving."),
       initial_state=self._safe_get_bool(self._params, "FordPrefUseVehicleGps"),
       callback=lambda state: self._toggle_callback(state, "FordPrefUseVehicleGps"),
       icon="speed_limit.png",

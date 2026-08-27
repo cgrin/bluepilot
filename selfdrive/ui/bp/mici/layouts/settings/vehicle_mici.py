@@ -25,7 +25,8 @@ class VehicleLayoutMici(NavScroller):
     self.steer_angle_curvature.set_enabled(self._pinion_yaw_sensor_supported)
     # cangpsd reads the car's own GPS off CAN and publishes it as gpsLocationExternal in
     # place of ubloxd -- for vehicles whose windshield blocks the device's GPS antenna.
-    # Ford-only (the CAN decode is Ford-specific); takes effect on the next drive.
+    # Ford-only (the CAN decode is Ford-specific); manager swaps the processes live, so
+    # it takes effect immediately, even while driving.
     self.use_vehicle_gps = BigParamControlBP("Use Vehicle GPS", "FordPrefUseVehicleGps")
     self.use_vehicle_gps.set_enabled(self._ford_vehicle_gps_supported)
     self.vbatt_pause_charging = BigParamFloatControl("12V Battery Limit", "vbatt_pause_charging", min=11.0, max=14.0, step=0.1)
