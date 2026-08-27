@@ -196,10 +196,11 @@ def decode_quality(vl: dict) -> dict:
     raw = round((vl[sig] - offset) / scale)
     return None if raw in sentinels else vl[sig]
 
-  # GPS_Sat_num_in_view is a 5-bit field the DBC bounds at [0|29], so 30/31 are
-  # sentinels. Verified against routes 0x101, 0x106 and 0xf1: this car reports a
-  # constant 31 even while stationary with PDOP 0.6, i.e. it never populates the
-  # count at all. Report 0 (unknown) rather than a fabricated 31 satellites.
+  # GPS_Sat_num_in_view is a 5-bit field the DBC bounds at [0|29], so 30/31 are sentinels.
+  # Every local route sampled reports a constant 31, but that is not a property of the car:
+  # across four public Mach-E segments the count is real about a quarter of the time, and
+  # two segments from one vehicle on identical firmware disagree. It is intermittent, not
+  # absent. Report 0 (unknown) rather than a fabricated 31 satellites.
   sat_count = int(vl["GPS_Sat_num_in_view"])
   altitude = valid("GPS_MSL_altitude", 10, -20460, 4094, 4095)
   speed = valid("GPS_Speed", 1, 0, 254, 255)
