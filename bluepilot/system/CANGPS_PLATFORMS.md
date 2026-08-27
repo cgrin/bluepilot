@@ -18,7 +18,10 @@ Four segments per platform, spread across each platform's full route list in com
 reached via `tools/lib/comma_car_segments.py`. Roughly 60 s of bus traffic per segment,
 transmit echoes (`src >= 128`) excluded. Frames were decoded with `cangpsd`'s own
 `make_parser` / `decode_position` / `decode_utc`, so this measures the production path.
-`FORD_ESCAPE_MK4_5` has only one public segment.
+`FORD_ESCAPE_MK4_5` has only one public segment. This run covers all 10 platforms with
+public data at 4 segments each, 20 of them across the classic-CAN platforms; an earlier run
+over just those platforms at 6 segments each (30 segments) reached the same conclusion
+independently. Segment counts quoted elsewhere should defer to this document.
 
 ## Message availability
 
@@ -41,9 +44,13 @@ those cars can supply position but never the wall clock, which is the entire rea
 daemon exists on the Mach-E. `FORD_FOCUS_MK4` is the outlier that also lacks `0x464`: it
 sends position and nothing else.
 
-Position decoded successfully on 100% of `0x462` frames on every platform. UTC decoded on
-97–100% of `0x463` frames where present; the shortfall is `Gps_B_Falt` set or PDOP out of
-range, which `decode_utc` correctly rejects.
+`decode_position` returned non-`None` on 100% of `0x462` frames on every platform — which
+means "returned a value", not "was correct". At the time of measurement it had no check for
+the minutes sentinels (`GPS_Latitude_Minutes` / `GPS_Longitude_Minutes`,
+`GPS_Latitude_Min_dec` / `GPS_Longitude_Min_dec`), each of which decodes to a plausible
+in-range position up to ~1.077° (~120 km) wrong. That gap is since fixed, but the fix
+postdates these numbers. UTC decoded on 97–100% of `0x463` frames where present; the
+shortfall is `Gps_B_Falt` set or PDOP out of range, which `decode_utc` correctly rejects.
 
 ### Not covered
 
