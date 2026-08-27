@@ -48,9 +48,10 @@ sends position and nothing else.
 means "returned a value", not "was correct". At the time of measurement it had no check for
 the minutes sentinels (`GPS_Latitude_Minutes` / `GPS_Longitude_Minutes`,
 `GPS_Latitude_Min_dec` / `GPS_Longitude_Min_dec`), each of which decodes to a plausible
-in-range position up to ~1.077° (~120 km) wrong. That gap is since fixed, but the fix
-postdates these numbers. UTC decoded on 97–100% of `0x463` frames where present; the
-shortfall is `Gps_B_Falt` set or PDOP out of range, which `decode_utc` correctly rejects.
+in-range position up to ~1.077° (~120 km) wrong. That gap is since fixed (`decode_position`
+now rejects them), but the fix postdates these numbers, so the 100% figure has not been
+re-measured and may drop by a frame or two on any platform once sentinel frames are
+rejected. UTC decoded on 97–100% of `0x463` frames where present; the shortfall is `Gps_B_Falt` set or PDOP out of range, which `decode_utc` correctly rejects.
 
 ### Not covered
 
