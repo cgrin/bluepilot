@@ -62,6 +62,9 @@ MAX_FIX_AGE = 3.0
 # ours to remove.
 KEEPALIVE_INTERVAL = 0.5
 
+# how often to look for the live CarParams while running off the previous route's copy
+CP_CHECK_INTERVAL = 1.0
+
 
 def should_publish(fresh_fix: bool, now: float, last_publish: float) -> bool:
   """Publish on a fresh 0x463, else once the topic is about to go stale.
@@ -198,6 +201,37 @@ def build_gps_msg(lat: float, lon: float, altitude: float, speed: float, bearing
   return msg
 
 
+# car.CarParams is a capnp struct module rather than a type, so it cannot form a `| None`
+# union; a deserialized CarParams is a _DynamicStructReader, the read side of the builder
+# type build_gps_msg returns.
+def load_car_params(params: Params, key: str, block: bool = False) -> capnp.lib.capnp._DynamicStructReader | None:
+  """Read a CarParams param, or None if it is absent, corrupt, or not a car we can decode."""
+  cp_bytes = params.get(key, block=block)
+  if cp_bytes is None:
+    return None
+  try:
+    CP = messaging.log_from_bytes(cp_bytes, car.CarParams)
+  except Exception:
+    cloudlog.exception(f"cangpsd: failed to deserialize {key}")
+    return None
+  if CP.carFingerprint not in DBC:
+    cloudlog.warning(f"cangpsd: no DBC for {CP.carFingerprint} in {key}")
+    return None
+  return CP
+
+
+def parser_config(CP: car.CarParams) -> tuple[str, int]:
+  return DBC[CP.carFingerprint][Bus.pt], CanBus(CP).main
+
+
+def make_parser(dbc_name: str, can_bus: int) -> CANParser:
+  return CANParser(dbc_name, [
+    ("APIMGPS_Data_Nav_1_FD1", 1),
+    ("APIMGPS_Data_Nav_2_FD1", 1),
+    ("APIMGPS_Data_Nav_3_FD1", 1),
+  ], can_bus)
+
+
 def make_pub_master(attempts: int = 5, delay: float = 1.0) -> messaging.PubMaster:
   """Open the gpsLocationExternal pub socket, retrying with backoff.
 
@@ -220,17 +254,29 @@ def make_pub_master(attempts: int = 5, delay: float = 1.0) -> messaging.PubMaste
 
 def main() -> NoReturn:
   params = Params()
-  cloudlog.info("cangpsd is waiting for CarParams")
-  CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
-  cloudlog.info("cangpsd got CarParams")
 
-  dbc_name = DBC[CP.carFingerprint][Bus.pt]
-  can_bus = CanBus(CP).main
-  cp = CANParser(dbc_name, [
-    ("APIMGPS_Data_Nav_1_FD1", 1),
-    ("APIMGPS_Data_Nav_2_FD1", 1),
-    ("APIMGPS_Data_Nav_3_FD1", 1),
-  ], can_bus)
+  # Start decoding from the previous drive's CarParams rather than blocking on the live one.
+  # card only publishes CarParams once it has fingerprinted the car, about six seconds into a
+  # boot, and until something publishes a fix timed.py cannot set the wall clock -- which is
+  # why cold-boot routes open stamped with the AGNOS flash date. The car is already sending
+  # 0x462/0x463 by then, so all that waiting buys us is a later clock. The live CP is
+  # reconciled in the loop below and the parser rebuilt if the car actually changed.
+  CP = load_car_params(params, "CarParams")
+  live_cp_pending = CP is None
+  if CP is None:
+    CP = load_car_params(params, "CarParamsPersistent")
+  if CP is not None:
+    cloudlog.info(f"cangpsd starting from {'live' if not live_cp_pending else 'previous route'} CarParams ({CP.carFingerprint})")
+  else:
+    cloudlog.info("cangpsd is waiting for CarParams")
+    CP = load_car_params(params, "CarParams", block=True)
+    if CP is None:
+      raise RuntimeError("cangpsd: CarParams names no car we have a DBC for")
+    cloudlog.info("cangpsd got CarParams")
+    live_cp_pending = False
+
+  dbc_name, can_bus = parser_config(CP)
+  cp = make_parser(dbc_name, can_bus)
 
   can_sock = messaging.sub_sock('can', timeout=20)
   pm = make_pub_master()
@@ -246,6 +292,8 @@ def main() -> NoReturn:
   last_utc_monotonic = now
   publish_millis = 0
   had_fix = False
+  ever_had_fix = False
+  next_cp_check = now
 
   rk = Ratekeeper(10, print_delay_threshold=None)
   last_publish = now - KEEPALIVE_INTERVAL
@@ -253,6 +301,24 @@ def main() -> NoReturn:
     fresh_fix = False
     can_strs = messaging.drain_sock_raw(can_sock, wait_for_one=False)
     now = time.monotonic()
+
+    # Reconcile the early start against the live CarParams once card publishes it. All Ford
+    # fingerprints share ford_lincoln_base_pt, so only the bus offset can realistically move
+    # -- but decoding the right addresses off the wrong bus would fail silently, so rebuild
+    # rather than assume. A brand change is manager's problem: the gate drops us instead.
+    if live_cp_pending and now >= next_cp_check:
+      next_cp_check = now + CP_CHECK_INTERVAL
+      live_CP = load_car_params(params, "CarParams")
+      if live_CP is not None:
+        live_cp_pending = False
+        if parser_config(live_CP) != (dbc_name, can_bus):
+          dbc_name, can_bus = parser_config(live_CP)
+          cloudlog.warning(f"cangpsd: car changed since last route, re-parsing {live_CP.carFingerprint} on bus {can_bus}")
+          cp = make_parser(dbc_name, can_bus)
+          # everything decoded so far came off the wrong bus
+          last_seen_pos = last_seen_time = 0.0
+          last_utc = None
+
     if can_strs:
       updated = cp.update(can_capnp_to_list(can_strs))
       if GPS_ADDR_POS in updated:
@@ -283,12 +349,18 @@ def main() -> NoReturn:
       elif had_fix and not has_fix:
         cloudlog.warning("cangpsd: GPS fix lost")
       had_fix = has_fix
+      ever_had_fix = ever_had_fix or has_fix
 
-      lat, lon = (position[0], position[1]) if position is not None else (0.0, 0.0)
-      quality = decode_quality(cp.vl[GPS_ADDR_QUALITY])
-      msg = build_gps_msg(lat, lon, quality["altitude"], quality["speed"], quality["bearing_deg"],
-                           publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix)
-      pm.send('gpsLocationExternal', msg)
+      # Stay silent until the first real decode. The keepalive above exists to hold
+      # SubMaster.alive true for consumers once we are a working GPS; before that there is
+      # nothing to hold up, and a zeroed sample (lat/lon 0, publish_millis 0 -> 1970) is
+      # indistinguishable on the wire from a receiver that is present and failing.
+      if ever_had_fix:
+        lat, lon = (position[0], position[1]) if position is not None else (0.0, 0.0)
+        quality = decode_quality(cp.vl[GPS_ADDR_QUALITY])
+        msg = build_gps_msg(lat, lon, quality["altitude"], quality["speed"], quality["bearing_deg"],
+                             publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix)
+        pm.send('gpsLocationExternal', msg)
 
     rk.keep_time()
 
