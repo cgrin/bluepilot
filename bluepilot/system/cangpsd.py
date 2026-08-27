@@ -65,6 +65,23 @@ KEEPALIVE_INTERVAL = 0.5
 # how often to look for the live CarParams while running off the previous route's copy
 CP_CHECK_INTERVAL = 1.0
 
+# Only the CAN FD Ford platforms broadcast 0x463; the classic-CAN ones (Escape MK4,
+# Explorer MK6, Focus MK4, Maverick MK1, Bronco Sport MK1) send 0x462 and mostly 0x464 but
+# never the time message. Measured over 6 spread-sampled public segments per platform from
+# commaCarSegments: 0x463 had zero frames on all 30 classic-CAN segments and full 1 Hz
+# coverage on every CAN FD one.
+#
+# Position is worth publishing on its own -- mapd, speed limits, athenad and the UI all
+# want lat/lon and none of them read unixTimestampMillis (timed.py is its only real
+# consumer). So a car with no 0x463 gets everything except the clock, which is the one
+# thing it could never have had.
+#
+# "No 0x463 on this platform" is only distinguishable from "the first 0x463 hasn't landed
+# yet" by waiting. Both messages are ~1 Hz, so several seconds of position frames with no
+# time frame settles it. Until the grace expires we publish nothing, so a car that does
+# have 0x463 never emits a position-only sample on the way up.
+NO_TIME_GRACE = 5.0
+
 
 def should_publish(fresh_fix: bool, now: float, last_publish: float) -> bool:
   """Publish on a fresh 0x463, else once the topic is about to go stale.
@@ -284,6 +301,10 @@ def main() -> NoReturn:
   now = time.monotonic()
   last_seen_pos = 0.0
   last_seen_time = 0.0
+  first_seen_pos = 0.0
+  # has this car ever sent a 0x463? distinguishes "waiting for the first one" from
+  # "this platform does not have the message at all" -- see NO_TIME_GRACE
+  ever_saw_time = False
   # timestamp of the last decoded 0x463 sample and the monotonic clock reading taken
   # at that moment -- unixTimestampMillis is advanced from these between CAN frames
   # using time.monotonic(), never time.time(): timed.py steps the wall clock off of
@@ -315,32 +336,59 @@ def main() -> NoReturn:
           dbc_name, can_bus = parser_config(live_CP)
           cloudlog.warning(f"cangpsd: car changed since last route, re-parsing {live_CP.carFingerprint} on bus {can_bus}")
           cp = make_parser(dbc_name, can_bus)
-          # everything decoded so far came off the wrong bus
-          last_seen_pos = last_seen_time = 0.0
+          # everything decoded so far came off the wrong bus, including the evidence
+          # about whether this platform has a time message at all
+          last_seen_pos = last_seen_time = first_seen_pos = 0.0
           last_utc = None
+          ever_saw_time = False
 
+    fresh_pos = False
     if can_strs:
       updated = cp.update(can_capnp_to_list(can_strs))
       if GPS_ADDR_POS in updated:
         last_seen_pos = now
+        fresh_pos = True
+        if first_seen_pos == 0.0:
+          first_seen_pos = now
       if GPS_ADDR_TIME in updated:
         last_seen_time = now
+        ever_saw_time = True
         fresh_fix = True
         utc = decode_utc(cp.vl[GPS_ADDR_TIME])
         if utc is not None:
           last_utc = utc
           last_utc_monotonic = now
 
+    # This car sends position but no time at all: 0x462 is then the only cadence we have,
+    # so phase-lock publishing to it instead of falling back to the bare keepalive.
+    no_time_source = (not ever_saw_time and first_seen_pos > 0.0
+                      and (now - first_seen_pos) >= NO_TIME_GRACE)
+    if no_time_source and fresh_pos:
+      fresh_fix = True
+
     if should_publish(fresh_fix, now, last_publish):
       last_publish = now
       time_fresh = (now - last_seen_time) < MAX_FIX_AGE
       pos_fresh = (now - last_seen_pos) < MAX_FIX_AGE
       position = decode_position(cp.vl[GPS_ADDR_POS])
-      has_fix = last_utc is not None and position is not None and time_fresh and pos_fresh
+
+      if no_time_source:
+        # position-only platform: a fix means a fresh, valid position and nothing more
+        has_fix = position is not None and pos_fresh
+      else:
+        has_fix = last_utc is not None and position is not None and time_fresh and pos_fresh
 
       if time_fresh and last_utc is not None:
         # hold the last decoded fix, advancing the clock by elapsed monotonic time
         publish_millis = int((last_utc.timestamp() + (now - last_utc_monotonic)) * 1000)
+      elif no_time_source:
+        # No GPS time exists on this car, and unixTimestampMillis has no "unknown" value.
+        # Publishing the system clock keeps timed.py inert -- the diff is ~0, so set_time
+        # returns on "Time diff too small", and if the clock is still at the AGNOS flash
+        # date it fails min_date() instead. Neither path feeds back into us, so the
+        # circularity that rules out time.time() on a car with real GPS time cannot arise
+        # here: there is no GPS time for timed to have set the clock from.
+        publish_millis = int(time.time() * 1000)  # noqa: TID251
       # else: 0x463 has gone stale -- freeze publish_millis and report no fix,
       # but keep publishing so SubMaster.alive stays true for consumers
 
