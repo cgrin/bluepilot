@@ -14,6 +14,7 @@ import datetime
 import pytest
 
 from openpilot.bluepilot.system.cangpsd import (
+  INFERRED_ACCURACY_FLOOR,
   KEEPALIVE_INTERVAL,
   MAX_FIX_AGE,
   NO_TIME_GRACE,
@@ -24,6 +25,7 @@ from openpilot.bluepilot.system.cangpsd import (
   FixTracker,
   TimeSource,
   build_gps_msg,
+  decode_inferred,
   decode_position,
   decode_quality,
   decode_utc,
@@ -34,6 +36,7 @@ from openpilot.bluepilot.system.cangpsd import (
 GOOD_TIME = {
   "Gps_B_Falt": 0, "GPS_Pdop": 1.0, "GpsUtcYr_No_Actl": 2026, "GpsUtcMnth_No_Actl": 8,
   "GpsUtcDay_No_Actl": 27, "GPS_UTC_hours": 0, "GPS_UTC_minutes": 33, "GPS_UTC_seconds": 45,
+  "GPS_Actual_vs_Infer_pos": 0,
 }
 
 # A good 0x462 sample: Seattle, 47.629057 N 122.342 W. Degrees are already signed by the
@@ -198,6 +201,20 @@ class TestDecodeQuality:
     assert QUALITY_UNKNOWN.keys() == decode_quality(GOOD_QUALITY).keys()
 
 
+class TestDecodeInferred:
+  def test_actual_position(self):
+    assert decode_inferred(GOOD_TIME) is False
+
+  def test_inferred_position(self):
+    assert decode_inferred({**GOOD_TIME, "GPS_Actual_vs_Infer_pos": 1}) is True
+
+  def test_does_not_gate_the_time_decode(self):
+    # Dead reckoning degrades position, not the clock -- the GPS receiver keeps its own
+    # time while inferring, and that clock is the whole reason this daemon exists. A car
+    # in a tunnel on a cold boot must still be able to set the time.
+    assert decode_utc({**GOOD_TIME, "GPS_Actual_vs_Infer_pos": 1}) == decode_utc(GOOD_TIME)
+
+
 class TestBuildGpsMsg:
   def build(self, **over):
     args = dict(lat=47.6, lon=-122.3, altitude=30.0, speed=18.0, bearing_deg=90.0,
@@ -252,6 +269,41 @@ class TestBuildGpsMsg:
     # of vdop, the same way speed=None/bearing_deg=None widen their own accuracies.
     gps = self.build(altitude=None, vdop=0.8)
     assert gps.verticalAccuracy == pytest.approx(UNKNOWN_ACCURACY)
+
+  def test_inferred_position_floors_both_position_accuracies(self):
+    # The bug this guards: GPS_Actual_vs_Infer_pos was unhandled, so a dead-reckoned
+    # position went out with whatever accuracy its hdop implied. Replaying one SR-99 tunnel
+    # transit, all 356 inferred frames published 3-19 m (median 19) -- indistinguishable
+    # from the 2-3 m the same drive reports on a real fix, for six minutes straight.
+    gps = self.build(hdop=0.6, vdop=0.8, inferred=True)
+    assert gps.horizontalAccuracy == pytest.approx(INFERRED_ACCURACY_FLOOR)
+    assert gps.verticalAccuracy == pytest.approx(INFERRED_ACCURACY_FLOOR)
+
+  def test_inferred_is_a_floor_not_an_assignment(self):
+    # An already-worse accuracy must survive; the flag may only widen.
+    gps = self.build(hdop=100.0, vdop=100.0, inferred=True)
+    assert gps.horizontalAccuracy == pytest.approx(500.0)
+    assert gps.verticalAccuracy == pytest.approx(500.0)
+
+  def test_actual_position_accuracy_is_unchanged(self):
+    # Position-only platforms never see the flag, so their behaviour must not move.
+    assert self.build(inferred=False).horizontalAccuracy == self.build().horizontalAccuracy
+
+  def test_inferred_does_not_clear_has_fix(self):
+    # Deliberate: the APIM dead-reckons well and the GPS clock stays valid, so a tunnel
+    # or garage -- the case this daemon exists for -- must keep publishing a usable fix.
+    assert self.build(inferred=True, has_fix=True).hasFix is True
+
+  def test_inferred_leaves_speed_and_bearing_accuracy_alone(self):
+    # Only the position is inferred; the car still measures its own speed and heading.
+    gps = self.build(inferred=True)
+    assert gps.speedAccuracy == pytest.approx(self.build().speedAccuracy)
+    assert gps.bearingAccuracyDeg == pytest.approx(self.build().bearingAccuracyDeg)
+
+  def test_inferred_floor_exceeds_anything_the_dbc_can_express(self):
+    # As with UNKNOWN_ACCURACY: a real dop reading can never reach the floor, so a
+    # consumer can tell a dead-reckoned sample from a merely poor one.
+    assert INFERRED_ACCURACY_FLOOR > 5.8 * 5.0
 
   def test_whole_unknown_quality_dict_builds(self):
     gps = build_gps_msg(47.6, -122.3, **{k: QUALITY_UNKNOWN[k] for k in
