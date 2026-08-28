@@ -95,6 +95,21 @@ UNKNOWN_ACCURACY = 30.0
 UNKNOWN_SPEED_ACCURACY = 50.0
 UNKNOWN_BEARING_ACCURACY = 180.0
 
+# Accuracy floor for a dead-reckoned (GPS_Actual_vs_Infer_pos) position. The APIM's DR is
+# good: across two SR-99 tunnel transits (356 frames / 5m55s and 137 frames / 2m16s) the
+# position jump on regaining a real fix was 24 m and 19 m, against a normal 1 Hz
+# sample-to-sample step of p50 7-10 m and p95 26 m -- i.e. no discontinuity resolvable at
+# this sample rate, and every jump explainable as the car simply moving. So the error is
+# bounded by tens of metres, not measured, and 30 m sits just past that bound. Same value
+# and same reasoning as UNKNOWN_ACCURACY ("no better than anything the signal could have
+# expressed"), kept separate because it answers a different question and may move alone.
+#
+# Deliberately a constant, not a ramp. Real DR error grows with time since the last true
+# fix, so this understates a long outage -- but the longest measured here is six minutes
+# and showed no resolvable error, so there is nothing to fit a growth rate to. A ramp
+# would be an invented number wearing a formula.
+INFERRED_ACCURACY_FLOOR = 30.0
+
 
 def should_publish(fresh_fix: bool, now: float, last_publish: float) -> bool:
   """Publish on a fresh 0x463, else once the topic is about to go stale.
@@ -200,6 +215,22 @@ QUALITY_UNKNOWN: dict = {"altitude": None, "speed": None, "bearing_deg": None,
                          "hdop": None, "vdop": None, "sat_count": 0}
 
 
+def decode_inferred(vl: dict) -> bool:
+  """Is the position in 0x462 dead-reckoned rather than measured?
+
+  GPS_Actual_vs_Infer_pos is a plain 1-bit enum in 0x463 (0 Actual_Postition,
+  1 Inferred_Position) with no sentinel, so there is nothing to range-check.
+
+  This is not a hasFix input. The APIM dead-reckons well -- measured over two SR-99
+  tunnel transits it tracked ~3.1 km of enclosed roadway -- and a tunnel or garage is
+  exactly where this daemon matters most, since the GPS clock stays valid while inferred
+  and that is the one thing the device cannot get anywhere else. Dropping the fix here
+  would throw away a usable position to no end. What the flag changes is the *claimed
+  accuracy*; see build_gps_msg.
+  """
+  return vl["GPS_Actual_vs_Infer_pos"] != 0
+
+
 def decode_quality(vl: dict) -> dict:
   """Decode the secondary fix-quality fields out of 0x464, None for anything unusable.
 
@@ -238,7 +269,7 @@ def decode_quality(vl: dict) -> dict:
 def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float | None,
                    bearing_deg: float | None, unix_timestamp_millis: int, hdop: float | None,
                    vdop: float | None, sat_count: int,
-                   has_fix: bool) -> capnp.lib.capnp._DynamicStructBuilder:
+                   has_fix: bool, inferred: bool = False) -> capnp.lib.capnp._DynamicStructBuilder:
   """Build a gpsLocationExternal message from already-decoded plain values.
 
   A None means the car never told us. GpsLocationData has no way to say "unknown" for a
@@ -265,11 +296,21 @@ def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float |
   # rather than leaving it at raw (possibly zero, e.g. before the first 0x464) hdop/vdop.
   # The DBC caps hdop/vdop at 5.8, so UNKNOWN_ACCURACY is one step past the worst the car
   # could have reported -- "no better than anything expressible", not an invented number.
-  gps.horizontalAccuracy = max(1.0, hdop * 5.0) if hdop is not None else UNKNOWN_ACCURACY
+  horizontal = max(1.0, hdop * 5.0) if hdop is not None else UNKNOWN_ACCURACY
   # verticalAccuracy has to widen on an unknown altitude too, not just an unknown vdop --
   # otherwise a missing GPS_MSL_altitude (published as 0.0 above) pairs with a valid vdop
   # to publish a confident sea-level reading. Speed/bearing below already couple this way.
-  gps.verticalAccuracy = max(1.0, vdop * 5.0) if (vdop is not None and altitude is not None) else UNKNOWN_ACCURACY
+  vertical = max(1.0, vdop * 5.0) if (vdop is not None and altitude is not None) else UNKNOWN_ACCURACY
+  # A dead-reckoned position is not as good as its dop values claim, and the dop values do
+  # not know that: PDOP correlates with the inferred flag but does not track it, because on
+  # a short outage the APIM's error has not accumulated yet and it stays confident. So the
+  # faster the tunnel, the more confident the wrong position -- exactly backwards. Floor
+  # both accuracies rather than trusting the reported dop; see INFERRED_ACCURACY_FLOOR.
+  if inferred:
+    horizontal = max(horizontal, INFERRED_ACCURACY_FLOOR)
+    vertical = max(vertical, INFERRED_ACCURACY_FLOOR)
+  gps.horizontalAccuracy = horizontal
+  gps.verticalAccuracy = vertical
   gps.speedAccuracy = 0.5 if speed is not None else UNKNOWN_SPEED_ACCURACY
   gps.bearingAccuracyDeg = 5.0 if bearing_deg is not None else UNKNOWN_BEARING_ACCURACY
   gps.hasFix = has_fix
@@ -517,7 +558,7 @@ def main() -> NoReturn:
       publish_millis = fix.timestamp_millis(now, wall_millis)
 
       if has_fix and not had_fix:
-        cloudlog.warning("cangpsd: first valid GPS fix acquired")
+        cloudlog.warning("cangpsd: GPS fix reacquired" if ever_had_fix else "cangpsd: first valid GPS fix acquired")
       elif had_fix and not has_fix:
         cloudlog.warning("cangpsd: GPS fix lost")
       had_fix = has_fix
@@ -532,8 +573,13 @@ def main() -> NoReturn:
         # Covers both "this car has no 0x464" (Focus MK4) and "0x464 has gone quiet":
         # stale altitude/speed/bearing are worse than admitting we do not know.
         quality = decode_quality(cp.vl[GPS_ADDR_QUALITY]) if fix.quality_fresh(now) else QUALITY_UNKNOWN
+        # The flag lives in 0x463 and only means anything while that frame is fresh. A
+        # position-only platform never has one, so those cars keep their current accuracy;
+        # on a 0x463 platform a stale time frame has already cleared has_fix via MAX_FIX_AGE.
+        inferred = fix.time_fresh(now) and decode_inferred(cp.vl[GPS_ADDR_TIME])
         msg = build_gps_msg(lat, lon, quality["altitude"], quality["speed"], quality["bearing_deg"],
-                             publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix)
+                             publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix,
+                             inferred)
         pm.send('gpsLocationExternal', msg)
 
     rk.keep_time()

@@ -92,9 +92,38 @@ frames). Any consumer of these signals has to handle sentinels per frame, not pe
 `GPS_dimension` reads a constant `2` (3D fix) on every platform and every frame sampled —
 it never indicated a degraded or absent fix, so it is not useful as a `hasFix` input.
 
-`GPS_Actual_vs_Infer_pos` is `0` (actual position) almost everywhere, but
-`FORD_RANGER_MK2` produced one inferred (dead-reckoned) sample out of 240. Rare, but the
-APIM does dead-reckon and will publish it as a normal fix, so it is real and unhandled.
+`GPS_Actual_vs_Infer_pos` is `0` (actual position) almost everywhere in the
+commaCarSegments sample -- `FORD_RANGER_MK2` produced one inferred (dead-reckoned) sample
+out of 240 -- but that undercounts it badly, because public segments are mostly open-sky
+highway. Measured on `FORD_MUSTANG_MACH_E_MK1` over three Seattle drives (60 min, 3542
+`0x463` frames): **556 frames (15.7%) were dead-reckoned, and 420 of those were published
+as `hasFix = True`**. 493 of the 556 were two transits of the SR-99 tunnel; the rest were
+one parking structure. Runs are long -- 356 frames (5m55s) and 137 frames (2m16s).
+
+The APIM dead-reckons well (both transits tracked ~3.1 km of enclosed roadway and exited
+within ~600 m of the real portal), so rejecting inferred position outright would discard a
+usable fix -- and would defeat the daemon's main purpose, since a garage or tunnel is
+exactly where the clock needs setting and the UTC stays valid while inferred.
+
+The problem is the *claimed accuracy*, and no other signal stands in for the flag. Two
+separate things are worth keeping straight: `GPS_Pdop` (0x463) is what the `hasFix` gate
+tests, while `horizontalAccuracy` is scaled from `GPS_Hdop` (0x464). Neither tracks dead
+reckoning.
+
+PDOP correlates with it but does not follow it -- on the congested 6-minute transit 184 of
+356 inferred frames rose above PDOP 3.0, but on the free-flowing 2-minute transit 87 of 161
+stayed at or below it, because the APIM's error had not accumulated yet. The shorter the
+outage, the more confident the car is about a position it made up.
+
+Hdop is worse: replaying the 6-minute transit through `build_gps_msg`, all 356
+dead-reckoned frames published a `horizontalAccuracy` between 3 and 19 m (median 19), which
+is indistinguishable from the 2-3 m the same drive reports with a real fix. Nothing in the
+message told a consumer those six minutes were inferred.
+
+Handled since `INFERRED_ACCURACY_FLOOR`: the fix keeps publishing, `hasFix` is untouched,
+and both position accuracies are floored to 30 m while the flag is set. Replay confirms
+every inferred frame now reports >= 30 m and every actual-position frame is byte-identical
+to the previous build.
 
 ## What this means for `cangpsd`
 
