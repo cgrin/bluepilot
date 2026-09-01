@@ -81,10 +81,22 @@ GPS_ADDR_TIME = 0x463
 # APIMGPS_Data_Nav_3_FD1: altitude, speed, heading, sat count, hdop/vdop
 GPS_ADDR_QUALITY = 0x464
 
-# Every address we parse. Must stay in step with make_parser() -- decode_gps_frames() drops
-# anything not listed here before the parser ever sees it, so an address added to one and
-# not the other would decode as permanently absent rather than fail loudly.
-GPS_ADDRS = frozenset((GPS_ADDR_POS, GPS_ADDR_TIME, GPS_ADDR_QUALITY))
+# The one place a GPS message is declared. Both the CANParser and decode_gps_frames()'s
+# filter are built from this, because they must not disagree: the filter runs first, so a
+# message the parser wants but the filter omits never reaches it and decodes as permanently
+# absent -- no error, no log, just a signal that is always stale.
+#
+# Kept as one tuple rather than two lists specifically so that porting this daemon to
+# another brand cannot reintroduce that gap. Everything else here is Ford-shaped (the DBC
+# and bus lookup in parser_config, the signal names in the decode functions, the sentinel
+# encodings), so a port rewrites plenty -- but those failures are loud, and this one would
+# not be.
+GPS_MESSAGES = (
+  ("APIMGPS_Data_Nav_1_FD1", GPS_ADDR_POS),
+  ("APIMGPS_Data_Nav_2_FD1", GPS_ADDR_TIME),
+  ("APIMGPS_Data_Nav_3_FD1", GPS_ADDR_QUALITY),
+)
+GPS_ADDRS = frozenset(address for _, address in GPS_MESSAGES)
 
 # capnp refuses to walk a large message without this. pandad's helper sets the same thing;
 # the `can` topic on a CAN FD car is well past the default limit.
@@ -506,12 +518,7 @@ def parser_config(CP: car.CarParams) -> tuple[str, int]:
 
 
 def make_parser(dbc_name: str, can_bus: int) -> CANParser:
-  # Keep in step with GPS_ADDRS, which pre-filters what ever reaches this parser.
-  return CANParser(dbc_name, [
-    ("APIMGPS_Data_Nav_1_FD1", 1),
-    ("APIMGPS_Data_Nav_2_FD1", 1),
-    ("APIMGPS_Data_Nav_3_FD1", 1),
-  ], can_bus)
+  return CANParser(dbc_name, [(name, 1) for name, _ in GPS_MESSAGES], can_bus)
 
 
 # Cached capnp schema field accessors, resolved on the first frame we see. Same trick as
@@ -528,6 +535,9 @@ def decode_gps_frames(can_strs: list[bytes]) -> list[tuple[int, list[tuple]]]:
   and a tuple -- and CANParser, which is pure Python in this tree, then walks the whole list
   again to discard all but ours. Reading the address first and only building a tuple on a
   hit measured 4.34% -> 2.10% of a core on device, about 2 points off cangpsd's ~5.8%.
+
+  The filter set comes from GPS_MESSAGES, the same declaration the parser is built from, so
+  the two cannot drift apart.
 
   Safe for cangpsd specifically, and not in general: pre-filtering makes the parser see an
   empty bus on nearly every cycle, so last_nonempty_nanos and everything built on it

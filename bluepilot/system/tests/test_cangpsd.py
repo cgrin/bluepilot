@@ -21,6 +21,7 @@ from openpilot.bluepilot.system.cangpsd import (
   GPS_ADDR_QUALITY,
   GPS_ADDR_TIME,
   GPS_ADDRS,
+  GPS_MESSAGES,
   INFERRED_ACCURACY_FLOOR,
   KEEPALIVE_INTERVAL,
   MAX_FIX_AGE,
@@ -371,9 +372,11 @@ class TestDecodeGpsFrames:
     assert decode_gps_frames([self._capnp([])])[0][1] == []
 
   def test_addrs_match_the_parser(self):
-    # Drift between GPS_ADDRS and make_parser() would decode as a permanently absent
-    # message rather than fail loudly, since the filter runs before the parser.
+    # GPS_MESSAGES is the single declaration both are built from, so this cannot drift by
+    # editing one of two lists. It can still drift if a DBC renames a message out from under
+    # us -- then the parser registers nothing for it while GPS_ADDRS still lists the address.
     assert set(make_parser("ford_lincoln_base_pt", 0).addresses) == set(GPS_ADDRS)
+    assert len(GPS_MESSAGES) == len(GPS_ADDRS)  # no duplicate addresses
 
 
 class TestShouldPublish:
