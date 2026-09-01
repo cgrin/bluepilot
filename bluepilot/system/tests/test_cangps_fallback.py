@@ -75,41 +75,54 @@ class TestArbiter:
     assert drive(a, NO_FIX_TIMEOUT + 60) == 1
     assert a.state.source == SOURCE_CAN
 
-  def test_will_not_switch_on_a_dead_reckoned_car_fix(self):
-    # The tunnel case, and the reason can_actual_fix exists. The APIM asserts a fix while
-    # it is inferring, so a tunnel long enough to run the device receiver out to the
-    # threshold would also satisfy a naive "does the car have a fix" guard. Excluding
-    # inferred fixes is what keeps the one plausible trigger from defeating the check.
+  def test_a_brief_car_fix_is_not_enough(self):
+    # A sliver of car-fix time in an otherwise blind window is noise, not evidence.
+    a = FallbackArbiter(FallbackState(vin="VIN1"))
+    assert drive(a, NO_FIX_TIMEOUT - CAN_FIX_MIN_S / 2, can_actual_fix=False) == 0
+    assert drive(a, CAN_FIX_MIN_S / 2, can_actual_fix=True) == 0
+    assert a.state.source == SOURCE_DEVICE
+
+  def test_evidence_is_cumulative_across_the_window(self):
+    # The commute case, and the reason this is not sampled at the threshold. Fifteen
+    # minutes of open sky where the car is fixed and the device receiver is not, then a
+    # tunnel that happens to cover the moment the threshold falls. The open-sky evidence
+    # decides it; where the car happens to be at minute twenty does not.
+    a = FallbackArbiter(FallbackState(vin="VIN1"))
+    open_sky = NO_FIX_TIMEOUT - 5 * 60
+    assert drive(a, open_sky, can_actual_fix=True) == 0
+    assert a.state.can_only_s == pytest.approx(open_sky)
+    # into the tunnel: the car is dead reckoning now, so no further evidence accrues
+    before = a.state.can_only_s
+    assert drive(a, 5 * 60 + DT, can_actual_fix=False) == 1
+    assert a.state.source == SOURCE_CAN
+    assert before == pytest.approx(open_sky)
+
+  def test_a_tunnel_alone_is_not_evidence(self):
+    # The mirror image, and the case the guard exists for: a device receiver that works
+    # fine outside and a tunnel long enough to reach the threshold on its own. Underground
+    # the car is dead reckoning too, so the window fills with no differential evidence at
+    # all and the switch is refused.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
     assert drive(a, NO_FIX_TIMEOUT + 60, can_actual_fix=False) == 0
     assert a.state.source == SOURCE_DEVICE
+    assert a.state.flips == 0
 
-  def test_a_brief_car_fix_is_not_enough(self):
-    # One good cycle at the moment the threshold happens to be crossed must not carry the
-    # decision -- the evidence has to be sustained.
+  def test_a_device_fix_clears_the_evidence_too(self):
+    # Evidence only means anything within one window. If the device receiver produces a fix
+    # the window is void, and the car-fix time collected against it goes with it -- else a
+    # working receiver would slowly accumulate a case against itself over months.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
-    assert drive(a, NO_FIX_TIMEOUT - DT, can_actual_fix=False) == 0
-    assert drive(a, CAN_FIX_MIN_S / 2, can_actual_fix=True) == 0
-    assert a.state.source == SOURCE_DEVICE
-    # and once it has been held long enough, the next threshold crossing takes it
-    assert drive(a, NO_FIX_TIMEOUT + 60, can_actual_fix=True) == 1
-    assert a.state.source == SOURCE_CAN
+    drive(a, CAN_FIX_MIN_S * 4, can_actual_fix=True)
+    assert a.state.can_only_s > 0.0
+    drive(a, DT, published_fix=True)
+    assert a.state.can_only_s == 0.0
+    assert a.state.no_fix_s == 0.0
 
-  def test_an_interrupted_car_fix_run_restarts(self):
-    # Any inferred or missing frame resets the run, so the requirement is CAN_FIX_MIN_S
-    # continuous rather than cumulative.
+  def test_evidence_does_not_accrue_while_parked(self):
+    # It is measured inside the no-fix window, which parked time never enters.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
-    drive(a, CAN_FIX_MIN_S * 2, can_actual_fix=True)
-    assert a.can_actual_s >= CAN_FIX_MIN_S
-    drive(a, DT, can_actual_fix=False)
-    assert a.can_actual_s == 0.0
-
-  def test_car_fix_evidence_accrues_while_parked(self):
-    # It is evidence about the candidate, not about the incumbent, so it is not gated on
-    # moving the way the no-fix accumulator is.
-    a = FallbackArbiter(FallbackState(vin="VIN1"))
-    drive(a, CAN_FIX_MIN_S * 2, moving=False, can_actual_fix=True)
-    assert a.can_actual_s >= CAN_FIX_MIN_S
+    drive(a, CAN_FIX_MIN_S * 4, moving=False, can_actual_fix=True)
+    assert a.state.can_only_s == 0.0
     assert a.state.no_fix_s == 0.0
 
   def test_switches_back_when_can_gps_also_fails(self):

@@ -79,22 +79,32 @@ PERSIST_INTERVAL = 60.0
 # actually seen work.
 MAX_FLIPS = 3
 
-# How long the car's own GPS must have been holding a real fix before we will switch to it.
+# How much of the no-fix window the car must have covered with a real fix of its own before
+# we will switch to it. This is a *differential* measurement -- time where the car had an
+# actual fix and the active source had none -- which is the only thing that distinguishes
+# the two cases that both end in "twenty minutes of moving with no fix":
 #
-# Two weaknesses in the obvious "is the car reporting a fix right now" check make this
-# necessary, and a tunnel triggers both at once. First, the check would be a single sample
-# taken at the instant the threshold is crossed, so one lucky cycle would be enough.
-# Second, and worse: the APIM asserts a fix while it is dead reckoning -- that is the 15.7%
-# of frames the drives found flagged GPS_Actual_vs_Infer_pos -- so "the car has a fix" is
-# true underground. A tunnel is the one condition that can plausibly run the device
-# receiver out to NO_FIX_TIMEOUT, and it is exactly when the naive guard fails open.
+#   Blocked windshield: the device receiver produces nothing across the whole window,
+#   including long stretches of open sky where the car is fixed the entire time. Minutes of
+#   direct head-to-head evidence that one source works here and the other does not.
 #
-# So the caller passes only *actual* (not inferred) fixes, and they have to have been
-# continuous for this long. Any inferred or missing frame resets the run to zero. Thirty
-# seconds is short next to the twenty-minute threshold it guards -- on a car whose APIM
-# works this is met continuously while driving -- but long enough that a blip cannot carry
-# the decision. Being refused costs nothing but another NO_FIX_TIMEOUT of waiting, so this
-# is deliberately biased toward refusing.
+#   Long tunnel, working receiver: outside, both sources are fixed, so any device fix zeroes
+#   the window before it can grow. Inside, the device receiver has nothing -- but neither
+#   does the car, which is dead reckoning through the same tunnel. The window can only reach
+#   the threshold on tunnel time, and tunnel time contributes no differential evidence.
+#
+# Hence *actual* fixes only: the APIM asserts a fix while inferring (the 15.7% of frames the
+# drives found flagged GPS_Actual_vs_Infer_pos), so counting inferred ones would make a
+# tunnel look like proof that the car's GPS works underground.
+#
+# Accumulated across the window rather than sampled at its end, and cumulative rather than
+# continuous. Sampling at the end would discard fifteen minutes of open-sky evidence just
+# because the threshold happened to fall inside a tunnel -- and since a refusal restarts the
+# window, a tunnel at a fixed point in a commute could defer the switch forever.
+#
+# Thirty seconds is a low bar deliberately: a genuinely blocked windshield clears it by
+# orders of magnitude (minutes to tens of minutes), while the tunnel case sits at zero. It
+# exists to reject noise, not to be a hurdle.
 CAN_FIX_MIN_S = 30.0
 
 
@@ -104,6 +114,10 @@ class FallbackState:
   vin: str = ""
   source: str = SOURCE_DEVICE
   no_fix_s: float = 0.0
+  # Of that no_fix_s, how much the car covered with an actual fix. Persisted alongside it
+  # because they describe one window: this device's mid-drive resets would otherwise drop
+  # the evidence while keeping the accumulator that needs it.
+  can_only_s: float = 0.0
   flips: int = 0
 
   @property
@@ -135,6 +149,7 @@ def load_state(params: Params, vin: str) -> FallbackState:
       vin=str(raw.get("vin", "")),
       source=str(raw.get("source", SOURCE_DEVICE)),
       no_fix_s=float(raw.get("no_fix_s", 0.0)),
+      can_only_s=float(raw.get("can_only_s", 0.0)),
       flips=int(raw.get("flips", 0)),
     )
   except (TypeError, ValueError):
@@ -177,10 +192,6 @@ class FallbackArbiter:
     self.state = state
     self.since_persist = 0.0
     self.dirty = False
-    # Evidence about the *candidate*, not the incumbent, and deliberately not persisted:
-    # it is a claim about right now, and a stored one would let a run that ended before the
-    # last reboot authorise a switch after it.
-    self.can_actual_s = 0.0
 
   def update(self, dt: float, moving: bool, published_fix: bool, can_actual_fix: bool) -> bool:
     """Advance the measurement by `dt` seconds. True if the selected source changed.
@@ -191,16 +202,13 @@ class FallbackArbiter:
     if self.state.settled:
       return False
 
-    # Accrue before the early returns below. This measures the candidate source, so unlike
-    # the no-fix accumulator it is not conditioned on moving or on the incumbent's state --
-    # a car sitting with a good fix is still telling us its GPS works.
-    self.can_actual_s = self.can_actual_s + dt if can_actual_fix else 0.0
-
     if published_fix:
       # One fix is proof the active source works. Anything we had accumulated against it
-      # was a transient -- a tunnel, a parking structure -- not a dead antenna.
-      if self.state.no_fix_s != 0.0:
+      # was a transient -- a tunnel, a parking structure -- not a dead antenna. The
+      # differential evidence goes with it: it only means anything within one window.
+      if self.state.no_fix_s != 0.0 or self.state.can_only_s != 0.0:
         self.state.no_fix_s = 0.0
+        self.state.can_only_s = 0.0
         self.dirty = True
       return False
 
@@ -210,6 +218,10 @@ class FallbackArbiter:
       return False
 
     self.state.no_fix_s += dt
+    # The active source has nothing right now. If the car does -- a real fix, not a
+    # dead-reckoned one -- then this second is head-to-head evidence between them.
+    if can_actual_fix:
+      self.state.can_only_s += dt
     self.since_persist += dt
     if self.since_persist >= PERSIST_INTERVAL:
       self.since_persist = 0.0
@@ -218,18 +230,18 @@ class FallbackArbiter:
     if self.state.no_fix_s < NO_FIX_TIMEOUT:
       return False
 
-    return self._switch(self.can_actual_s >= CAN_FIX_MIN_S)
+    return self._switch(self.state.can_only_s >= CAN_FIX_MIN_S)
 
   def _switch(self, can_ready: bool) -> bool:
     """The active source has failed its threshold. Move only if there is somewhere to go."""
     if self.state.source == SOURCE_DEVICE:
       if not can_ready:
-        # The device receiver is dead, but the car is not offering a fix we believe -- a
-        # Ford with no GPS on CAN, an APIM that has none right now, or one that is dead
-        # reckoning through the same tunnel that just ran the device receiver out.
-        # Switching would trade one silent source for another, so keep waiting and
-        # re-check in another NO_FIX_TIMEOUT of driving.
+        # The window filled up, but almost none of it was time where the car had a real
+        # fix and the device receiver did not -- a Ford with no GPS on CAN, or a tunnel
+        # both receivers spent inferring or blind. Nothing here says CAN GPS would do
+        # better, so restart the window rather than trade one silent source for another.
         self.state.no_fix_s = 0.0
+        self.state.can_only_s = 0.0
         self.dirty = True
         return False
       new_source = SOURCE_CAN
@@ -239,10 +251,12 @@ class FallbackArbiter:
       # here, and the flip count bounds the loop.
       new_source = SOURCE_DEVICE
 
-    reason = f"after {self.state.no_fix_s:.0f}s of driving with no fix"
+    evidence = f"{self.state.can_only_s:.0f}s of it with a real CAN fix"
+    reason = f"after {self.state.no_fix_s:.0f}s of driving with no fix ({evidence})"
     cloudlog.warning(f"cangps_fallback: switching GPS source {self.state.source} -> {new_source} {reason}")
     self.state.source = new_source
     self.state.no_fix_s = 0.0
+    self.state.can_only_s = 0.0
     self.state.flips += 1
     self.dirty = True
     if self.state.settled:
