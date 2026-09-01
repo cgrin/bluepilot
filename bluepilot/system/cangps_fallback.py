@@ -48,13 +48,22 @@ FALLBACK_PARAM = "CanGpsFallbackState"
 SOURCE_DEVICE = "device"
 SOURCE_CAN = "can"
 
-# Seconds of *moving* with no fix before a source is declared dead. Twenty minutes is
-# chosen to be far past any legitimate outage: cold-start TTFF is seconds, a long tunnel
-# is single-digit minutes, and the worst real-world urban canyon still yields something
-# inside a commute. Counting seconds rather than drives matters -- three short errands
-# into a covered garage would trip a drive counter, and one long tree-lined commute would
-# not trip it at all.
-NO_FIX_TIMEOUT = 20 * 60.0
+# Seconds of *moving* with no fix before the active source is considered to have failed.
+#
+# This is a coarse pre-filter, not the safety check. It was twenty minutes when it *was*
+# the safety check -- sized at roughly 3x the longest outage measured on this car (a
+# six-minute SR-99 transit) because nothing else stood between a tunnel and a false switch.
+# CAN_FIX_MIN_S below now carries that job, and carries it better: a tunnel yields no
+# differential evidence however long it lasts, so tunnel protection no longer depends on
+# this number at all.
+#
+# What remains is "do not even evaluate a switch until the incumbent has clearly failed",
+# and ten minutes is sized for that. Note what it already excludes for free: the window
+# zeroes on a single fix, so cold-start TTFF, brief dropouts and ordinary canyon work can
+# never reach any threshold -- getting here needs ten continuous minutes of moving with
+# nothing at all. Counting seconds rather than drives matters too: three short errands into
+# a covered garage would trip a drive counter, and one long tree-lined commute would not.
+NO_FIX_TIMEOUT = 10 * 60.0
 
 # vEgo below this is not driving, so it is not evidence either way.
 MIN_SPEED = 0.5
@@ -82,7 +91,7 @@ MAX_FLIPS = 3
 # How much of the no-fix window the car must have covered with a real fix of its own before
 # we will switch to it. This is a *differential* measurement -- time where the car had an
 # actual fix and the active source had none -- which is the only thing that distinguishes
-# the two cases that both end in "twenty minutes of moving with no fix":
+# the two cases that both end in NO_FIX_TIMEOUT of moving with no fix:
 #
 #   Blocked windshield: the device receiver produces nothing across the whole window,
 #   including long stretches of open sky where the car is fixed the entire time. Minutes of
@@ -98,9 +107,9 @@ MAX_FLIPS = 3
 # tunnel look like proof that the car's GPS works underground.
 #
 # Accumulated across the window rather than sampled at its end, and cumulative rather than
-# continuous. Sampling at the end would discard fifteen minutes of open-sky evidence just
-# because the threshold happened to fall inside a tunnel -- and since a refusal restarts the
-# window, a tunnel at a fixed point in a commute could defer the switch forever.
+# continuous. Sampling at the end would discard a whole commute's worth of open-sky evidence
+# just because the threshold happened to fall inside a tunnel -- and since a refusal restarts
+# the window, a tunnel at a fixed point in a commute could defer the switch forever.
 #
 # Thirty seconds is a low bar deliberately: a genuinely blocked windshield clears it by
 # orders of magnitude (minutes to tens of minutes), while the tunnel case sits at zero. It
