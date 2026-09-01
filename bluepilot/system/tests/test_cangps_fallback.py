@@ -80,13 +80,18 @@ class TestArbiter:
     assert a.state.source == SOURCE_DEVICE
 
   def test_stops_flipping_after_max_flips(self):
-    # Neither source works. Alternate a bounded number of times, then stay put on stock
-    # behaviour rather than restarting the daemon every twenty minutes forever.
+    # Neither source works. Alternate a bounded number of times, then stay put rather than
+    # restarting the daemon every twenty minutes forever.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
     switches = drive(a, NO_FIX_TIMEOUT * (MAX_FLIPS + 3))
     assert switches == MAX_FLIPS
     assert a.state.settled
     assert drive(a, NO_FIX_TIMEOUT * 2) == 0
+    # And pin *where* it stops. The flips alternate from SOURCE_DEVICE, so an odd MAX_FLIPS
+    # settles on CAN -- the side whose transitions require positive evidence. Asserting the
+    # count alone let a comment claiming the opposite ("parks on stock behaviour") survive.
+    assert MAX_FLIPS % 2 == 1
+    assert a.state.source == SOURCE_CAN
 
   def test_settled_state_stops_accumulating(self):
     a = FallbackArbiter(FallbackState(vin="VIN1", flips=MAX_FLIPS))

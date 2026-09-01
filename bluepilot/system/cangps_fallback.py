@@ -66,8 +66,17 @@ PERSIST_INTERVAL = 60.0
 
 # Stop switching after this many changes on one VIN. On a car where neither source works
 # the rule above would otherwise alternate forever, one flip per threshold. Three attempts
-# is enough to have genuinely tried both, after which we park on ublox (the stock
-# behaviour) and leave it alone until the car changes.
+# is enough to have genuinely tried both, after which the state freezes until the car
+# changes.
+#
+# Note where it freezes: the flips strictly alternate from SOURCE_DEVICE, so the third one
+# always lands on SOURCE_CAN. That is deliberate, not an accident of the count -- switching
+# *to* CAN requires positive proof that the car has a fix of its own (`can_fix`), while
+# switching back to the device receiver requires no such evidence. The transitions toward
+# CAN are the better-evidenced ones, so if we must give up somewhere, give up there. An
+# even MAX_FLIPS would settle on the device receiver instead; that would be the choice to
+# make if resting on stock behaviour ever matters more than resting on the source we have
+# actually seen work.
 MAX_FLIPS = 3
 
 
