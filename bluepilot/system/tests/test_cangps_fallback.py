@@ -1,6 +1,7 @@
 """Unit tests for the automatic GPS source selection.
 
-The arbiter is deliberately a pure state machine over (dt, moving, published_fix, can_fix),
+The arbiter is deliberately a pure state machine over
+(dt, moving, published_fix, can_actual_fix),
 with no sockets or params, so a twenty-minute threshold can be exercised in a few hundred
 microseconds. The cases that matter are the ones where it must *not* switch: a receiver
 that is merely in a tunnel, a car parked for a week, and a Ford whose own GPS is no better
@@ -9,6 +10,7 @@ than the one we would be leaving.
 import pytest
 
 from openpilot.bluepilot.system.cangps_fallback import (
+  CAN_FIX_MIN_S,
   MAX_FLIPS,
   NO_FIX_TIMEOUT,
   SOURCE_CAN,
@@ -22,11 +24,11 @@ from openpilot.bluepilot.system.cangps_fallback import (
 DT = 0.5
 
 
-def drive(arbiter, seconds, moving=True, published_fix=False, can_fix=True):
+def drive(arbiter, seconds, moving=True, published_fix=False, can_actual_fix=True):
   """Run the arbiter for `seconds`, returning the number of source switches."""
   switches = 0
   for _ in range(int(seconds / DT)):
-    switches += arbiter.update(DT, moving, published_fix, can_fix)
+    switches += arbiter.update(DT, moving, published_fix, can_actual_fix)
   return switches
 
 
@@ -65,7 +67,7 @@ class TestArbiter:
     # A Ford with no 0x462, or an APIM that has no fix right now: switching would trade one
     # silent source for another and leave the driver worse off than stock.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
-    assert drive(a, NO_FIX_TIMEOUT + 60, can_fix=False) == 0
+    assert drive(a, NO_FIX_TIMEOUT + 60, can_actual_fix=False) == 0
     assert a.state.source == SOURCE_DEVICE
     assert a.state.flips == 0
     # ...but it re-arms rather than giving up, so a car that acquires later still wins
@@ -73,10 +75,47 @@ class TestArbiter:
     assert drive(a, NO_FIX_TIMEOUT + 60) == 1
     assert a.state.source == SOURCE_CAN
 
+  def test_will_not_switch_on_a_dead_reckoned_car_fix(self):
+    # The tunnel case, and the reason can_actual_fix exists. The APIM asserts a fix while
+    # it is inferring, so a tunnel long enough to run the device receiver out to the
+    # threshold would also satisfy a naive "does the car have a fix" guard. Excluding
+    # inferred fixes is what keeps the one plausible trigger from defeating the check.
+    a = FallbackArbiter(FallbackState(vin="VIN1"))
+    assert drive(a, NO_FIX_TIMEOUT + 60, can_actual_fix=False) == 0
+    assert a.state.source == SOURCE_DEVICE
+
+  def test_a_brief_car_fix_is_not_enough(self):
+    # One good cycle at the moment the threshold happens to be crossed must not carry the
+    # decision -- the evidence has to be sustained.
+    a = FallbackArbiter(FallbackState(vin="VIN1"))
+    assert drive(a, NO_FIX_TIMEOUT - DT, can_actual_fix=False) == 0
+    assert drive(a, CAN_FIX_MIN_S / 2, can_actual_fix=True) == 0
+    assert a.state.source == SOURCE_DEVICE
+    # and once it has been held long enough, the next threshold crossing takes it
+    assert drive(a, NO_FIX_TIMEOUT + 60, can_actual_fix=True) == 1
+    assert a.state.source == SOURCE_CAN
+
+  def test_an_interrupted_car_fix_run_restarts(self):
+    # Any inferred or missing frame resets the run, so the requirement is CAN_FIX_MIN_S
+    # continuous rather than cumulative.
+    a = FallbackArbiter(FallbackState(vin="VIN1"))
+    drive(a, CAN_FIX_MIN_S * 2, can_actual_fix=True)
+    assert a.can_actual_s >= CAN_FIX_MIN_S
+    drive(a, DT, can_actual_fix=False)
+    assert a.can_actual_s == 0.0
+
+  def test_car_fix_evidence_accrues_while_parked(self):
+    # It is evidence about the candidate, not about the incumbent, so it is not gated on
+    # moving the way the no-fix accumulator is.
+    a = FallbackArbiter(FallbackState(vin="VIN1"))
+    drive(a, CAN_FIX_MIN_S * 2, moving=False, can_actual_fix=True)
+    assert a.can_actual_s >= CAN_FIX_MIN_S
+    assert a.state.no_fix_s == 0.0
+
   def test_switches_back_when_can_gps_also_fails(self):
     a = FallbackArbiter(FallbackState(vin="VIN1", source=SOURCE_CAN))
     # publishing mode: our own fix is the published one, and it is absent
-    assert drive(a, NO_FIX_TIMEOUT + 60, can_fix=False) == 1
+    assert drive(a, NO_FIX_TIMEOUT + 60, can_actual_fix=False) == 1
     assert a.state.source == SOURCE_DEVICE
 
   def test_stops_flipping_after_max_flips(self):

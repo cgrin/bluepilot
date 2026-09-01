@@ -656,6 +656,14 @@ def main() -> NoReturn:
       had_fix = has_fix
       ever_had_fix = ever_had_fix or has_fix
 
+      # 0x463's dead-reckoning flag. Needed in *both* modes, which is why it is computed
+      # here rather than in the publish branch below: publishing uses it to widen the
+      # accuracies, and observing uses it to tell the arbiter whether the car's fix is real.
+      # The flag only means anything while 0x463 is fresh. A position-only platform never
+      # has one, so those cars keep their current accuracy; on a 0x463 platform a stale time
+      # frame has already cleared has_fix via MAX_FIX_AGE.
+      inferred = fix.time_fresh(now) and decode_inferred(cp.vl[GPS_ADDR_TIME])
+
       # Stay silent until the first real decode. The keepalive above exists to hold
       # SubMaster.alive true for consumers once we are a working GPS; before that there is
       # nothing to hold up, and a zeroed sample (lat/lon 0, publish_millis 0 -> 1970) is
@@ -665,10 +673,6 @@ def main() -> NoReturn:
         # Covers both "this car has no 0x464" (Focus MK4) and "0x464 has gone quiet":
         # stale altitude/speed/bearing are worse than admitting we do not know.
         quality = decode_quality(cp.vl[GPS_ADDR_QUALITY]) if fix.quality_fresh(now) else QUALITY_UNKNOWN
-        # The flag lives in 0x463 and only means anything while that frame is fresh. A
-        # position-only platform never has one, so those cars keep their current accuracy;
-        # on a 0x463 platform a stale time frame has already cleared has_fix via MAX_FIX_AGE.
-        inferred = fix.time_fresh(now) and decode_inferred(cp.vl[GPS_ADDR_TIME])
         msg = build_gps_msg(lat, lon, quality["altitude"], quality["speed"], quality["bearing_deg"],
                              publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix,
                              inferred, service=gps_service)
@@ -683,11 +687,15 @@ def main() -> NoReturn:
         sm.update(0)
         moving = sm.alive['carState'] and sm['carState'].vEgo > MIN_SPEED
         # Who currently owns the topic decides where "is it working" comes from. As the
-        # publisher that is our own fix; as an observer it is whatever ubloxd is sending,
-        # and a topic that has gone silent entirely counts as no fix.
+        # publisher that is our own fix; as an observer it is whatever the device's GPS
+        # daemon is sending, and a topic that has gone silent entirely counts as no fix.
         published_fix = has_fix if publishing else (sm.alive[gps_service] and
                                                     sm[gps_service].hasFix)
-        if arbiter.update(dt, moving, published_fix, has_fix):
+        # Dead-reckoned fixes are excluded deliberately: the APIM asserts a fix while
+        # inferring, so passing raw has_fix would let a tunnel -- the one thing likely to
+        # run the device receiver out to NO_FIX_TIMEOUT -- also satisfy the guard meant to
+        # catch it. See CAN_FIX_MIN_S.
+        if arbiter.update(dt, moving, published_fix, has_fix and not inferred):
           save_state(params, arbiter.state)
           # Exit rather than swap the pub socket in place. manager re-reads the ubloxd gate
           # against the state just written and starts us again a moment later; going out
