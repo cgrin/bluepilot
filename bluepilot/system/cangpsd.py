@@ -599,7 +599,7 @@ def select_mode(params: Params, CP) -> tuple[bool, FallbackArbiter | None]:
 
   The manual toggle wins outright and skips measurement entirely: a user who has ticked it
   has already diagnosed the problem the arbiter exists to discover, and second-guessing
-  them by handing the topic back after twenty quiet minutes would be obnoxious.
+  them by handing the topic back after NO_FIX_TIMEOUT of quiet would be obnoxious.
   """
   if params.get_bool("FordPrefUseVehicleGps"):
     cloudlog.info("cangpsd: publishing (FordPrefUseVehicleGps is set)")
