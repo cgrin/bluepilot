@@ -99,6 +99,7 @@ class BluePilotLayout(Widget):
       ("BPUseCustomSounds", self._use_custom_sounds),
       ("FordPrefShowRadarLeadOverlay", self._show_ford_radar_overlay),
       ("FordPrefUseVehicleGps", self._use_vehicle_gps),
+      ("FordPrefAutoVehicleGps", self._auto_vehicle_gps),
       ("FordPrefHybridBatteryStatus", self._show_hybrid_battery_status),
       ("FordPrefHybridPowerFlow", self._show_hybrid_power_flow),
       ("enable_human_turn_detection_curv", self._enable_human_turn_detection),
@@ -293,6 +294,20 @@ class BluePilotLayout(Widget):
                  + "Useful when the windshield blocks the device's GPS. Takes effect immediately, even while driving."),
       initial_state=self._safe_get_bool(self._params, "FordPrefUseVehicleGps"),
       callback=lambda state: self._toggle_callback(state, "FordPrefUseVehicleGps"),
+      icon="speed_limit.png",
+      enabled=self._ford_vehicle_gps_supported,
+    )
+
+    # Automatic version of the toggle above. The failure it works around is silent -- a
+    # blocked windshield produces no alert, just routes stamped with the flash date -- so
+    # most affected drivers never think to look for the manual toggle.
+    self._auto_vehicle_gps = toggle_item(
+      lambda: tr("Auto-detect Vehicle GPS (Ford)"),
+      lambda: tr("Watch the device's own GPS receiver, and switch to the vehicle's GPS automatically if it "
+                 + "never gets a fix while driving. Only switches once the vehicle's GPS is confirmed working, "
+                 + "and switches back if it isn't. Ignored while the toggle above is on."),
+      initial_state=self._safe_get_bool(self._params, "FordPrefAutoVehicleGps"),
+      callback=lambda state: self._toggle_callback(state, "FordPrefAutoVehicleGps"),
       icon="speed_limit.png",
       enabled=self._ford_vehicle_gps_supported,
     )
@@ -711,6 +726,7 @@ class BluePilotLayout(Widget):
         self._show_hands_free_ui,
         self._steer_angle_curvature,
         self._use_vehicle_gps,
+        self._auto_vehicle_gps,
         self._vbatt_pause_charging,
       ]) +
       _section(tr("Audio"), [

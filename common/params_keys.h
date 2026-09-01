@@ -17,6 +17,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AthenadRecentlyViewedRoutes", {PERSISTENT, STRING}},
     {"BootCount", {PERSISTENT, INT}},
     {"CalibrationParams", {PERSISTENT, BYTES}},
+    {"CanGpsFallbackState", {PERSISTENT | BACKUP, JSON, "{}"}},  // which GPS source cangpsd picked, per VIN
     {"CameraDebugExpGain", {CLEAR_ON_MANAGER_START, STRING}},
     {"CameraDebugExpTime", {CLEAR_ON_MANAGER_START, STRING}},
     {"CarBatteryCapacity", {PERSISTENT, INT}},
@@ -321,6 +322,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"FordPrefSteerAngleCurvature", {PERSISTENT | BACKUP, BOOL, "0"}},  // pinion-sourced curvature measurement (bad-yaw-sensor workaround); read at car init
     {"FordPrefShowRadarLeadOverlay", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"FordPrefUseVehicleGps", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"FordPrefAutoVehicleGps", {PERSISTENT | BACKUP, BOOL, "0"}},  // let cangpsd decide, instead of the toggle above
     {"FordPrefRadarOverlaySize", {PERSISTENT | BACKUP, INT, "1"}},
     {"FordPrefHybridBatteryStatus", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"FordPrefHybridPowerFlow", {PERSISTENT | BACKUP, BOOL, "0"}},
