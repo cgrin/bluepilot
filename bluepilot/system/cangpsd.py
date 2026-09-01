@@ -21,8 +21,9 @@ what a comma 3X user saw when the toggle appeared to do nothing.
 Do not shortcut that to a device model. ublox_available() is a probe, not a lookup: it
 tests for /dev/ttyHS0 and for the /persist/comma/use-quectel-gps override, so a board with
 both receivers can be flipped either way and one model does not imply one answer. Every
-comma 3X is Quectel; the comma 4 this daemon was developed and driven on probes ublox, but
-that is one device, not a claim about the model.
+comma 3X is Quectel; the comma 4 this daemon was developed and driven on (model string
+"comma mici") probes ublox -- /dev/ttyHS0 present, no override, UbloxAvailable 1, measured
+on the device. That is one device, not a claim about every comma 4.
 
 The daemon runs in one of two modes. As the selected GPS source it publishes, as it always
 has. Otherwise it runs as an observer: it decodes the same CAN messages but sends nothing,
