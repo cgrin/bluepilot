@@ -6,9 +6,10 @@ date and a nav stack that never sees a position. Nobody goes looking for a toggl
 failure they have not noticed, so the toggle only ever helps people who already diagnosed
 it. This module makes the choice automatically instead.
 
-The two sources are the *device* receiver -- whichever daemon owns it, ubloxd/pigeond on a
-comma three or qcomgpsd on a 3X -- and the car's own GPS on CAN. Which chip is fitted does
-not change any of the reasoning here, so the state records "device" rather than naming one.
+The two sources are the *device* receiver -- whichever daemon owns it, ubloxd/pigeond or
+qcomgpsd, decided by the ublox_available() probe rather than by which comma the code is
+running on -- and the car's own GPS on CAN. Which receiver is fitted changes none of the
+reasoning here, so the state records "device" rather than naming one.
 
 The rule is deliberately asymmetric. We leave the device receiver in charge until it has
 *proven* it cannot work -- many minutes of driving with no fix at all -- and we only switch
@@ -41,9 +42,9 @@ from openpilot.common.swaglog import cloudlog
 
 FALLBACK_PARAM = "CanGpsFallbackState"
 
-# Named for the receiver, not the daemon that reads it: "device" covers ubloxd/pigeond on a
-# comma three and qcomgpsd on a 3X. An earlier draft called this "ublox", which was only ever
-# true of one of the two.
+# Named for the receiver, not the daemon that reads it: "device" covers both ubloxd/pigeond
+# and qcomgpsd. An earlier draft called this "ublox", which was only ever true of some
+# devices -- and which model has which receiver is not something this file should encode.
 SOURCE_DEVICE = "device"
 SOURCE_CAN = "can"
 
