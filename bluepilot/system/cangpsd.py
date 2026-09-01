@@ -59,7 +59,6 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
-from openpilot.selfdrive.pandad import can_capnp_to_list
 from openpilot.bluepilot.system.cangps_fallback import (
   MIN_SPEED,
   SOURCE_CAN,
@@ -81,6 +80,15 @@ GPS_ADDR_POS = 0x462
 GPS_ADDR_TIME = 0x463
 # APIMGPS_Data_Nav_3_FD1: altitude, speed, heading, sat count, hdop/vdop
 GPS_ADDR_QUALITY = 0x464
+
+# Every address we parse. Must stay in step with make_parser() -- decode_gps_frames() drops
+# anything not listed here before the parser ever sees it, so an address added to one and
+# not the other would decode as permanently absent rather than fail loudly.
+GPS_ADDRS = frozenset((GPS_ADDR_POS, GPS_ADDR_TIME, GPS_ADDR_QUALITY))
+
+# capnp refuses to walk a large message without this. pandad's helper sets the same thing;
+# the `can` topic on a CAN FD car is well past the default limit.
+CAPNP_NO_TRAVERSAL_LIMIT = 2**64 - 1
 
 # both 0x462 and 0x463 are ~1 Hz; beyond this we can no longer trust the held fix
 MAX_FIX_AGE = 3.0
@@ -498,11 +506,57 @@ def parser_config(CP: car.CarParams) -> tuple[str, int]:
 
 
 def make_parser(dbc_name: str, can_bus: int) -> CANParser:
+  # Keep in step with GPS_ADDRS, which pre-filters what ever reaches this parser.
   return CANParser(dbc_name, [
     ("APIMGPS_Data_Nav_1_FD1", 1),
     ("APIMGPS_Data_Nav_2_FD1", 1),
     ("APIMGPS_Data_Nav_3_FD1", 1),
   ], can_bus)
+
+
+# Cached capnp schema field accessors, resolved on the first frame we see. Same trick as
+# pandad's can_capnp_to_list -- looking fields up by name per frame is the slow path.
+_can_fields: tuple | None = None
+
+
+def decode_gps_frames(can_strs: list[bytes]) -> list[tuple[int, list[tuple]]]:
+  """can_capnp_to_list, but only for the three addresses we parse.
+
+  Worth diverging from the shared helper here because of the ratio involved: this car puts
+  ~8100 CAN frames/s on the topic and the GPS messages are 3 of them. The shared helper
+  materialises every frame -- three field reads, a bytes copy of dat (up to 64 B on CAN FD)
+  and a tuple -- and CANParser, which is pure Python in this tree, then walks the whole list
+  again to discard all but ours. Reading the address first and only building a tuple on a
+  hit measured 4.34% -> 2.10% of a core on device, about 2 points off cangpsd's ~5.8%.
+
+  Safe for cangpsd specifically, and not in general: pre-filtering makes the parser see an
+  empty bus on nearly every cycle, so last_nonempty_nanos and everything built on it
+  (can_valid, bus_timeout) become meaningless. cangpsd never reads them -- it tracks
+  staleness itself through FixTracker and MAX_FIX_AGE. A consumer that relies on the
+  parser's own validity machinery must keep using the shared helper.
+
+  Bus filtering is deliberately left to CANParser.update: an address on the wrong bus costs
+  one extra tuple per cycle, and duplicating the bus check here is one more thing to keep in
+  step with the parser.
+  """
+  global _can_fields
+  result = []
+  for s in can_strs:
+    with log.Event.from_bytes(s, traversal_limit_in_words=CAPNP_NO_TRAVERSAL_LIMIT) as event:
+      frames = event.can
+      if _can_fields is None and len(frames) > 0:
+        schema_fields = frames[0].schema.fields
+        _can_fields = (schema_fields['address'], schema_fields['dat'], schema_fields['src'])
+
+      kept: list[tuple] = []
+      if _can_fields is not None:
+        addr_f, dat_f, src_f = _can_fields
+        for f in frames:
+          address = f._get_by_field(addr_f)
+          if address in GPS_ADDRS:
+            kept.append((address, f._get_by_field(dat_f), f._get_by_field(src_f)))
+      result.append((event.logMonoTime, kept))
+  return result
 
 
 def make_pub_master(service: str = GPS_SERVICE_DEFAULT, attempts: int = 5, delay: float = 1.0) -> messaging.PubMaster:
@@ -632,7 +686,7 @@ def main() -> NoReturn:
 
     fresh_pos = fresh_time = False
     if can_strs:
-      updated = cp.update(can_capnp_to_list(can_strs))
+      updated = cp.update(decode_gps_frames(can_strs))
       if GPS_ADDR_POS in updated:
         fresh_pos = True
         fix.observe_position(now)

@@ -13,7 +13,14 @@ import datetime
 
 import pytest
 
+import cereal.messaging as messaging
+from openpilot.selfdrive.pandad import can_capnp_to_list
+
 from openpilot.bluepilot.system.cangpsd import (
+  GPS_ADDR_POS,
+  GPS_ADDR_QUALITY,
+  GPS_ADDR_TIME,
+  GPS_ADDRS,
   INFERRED_ACCURACY_FLOOR,
   KEEPALIVE_INTERVAL,
   MAX_FIX_AGE,
@@ -25,10 +32,12 @@ from openpilot.bluepilot.system.cangpsd import (
   FixTracker,
   TimeSource,
   build_gps_msg,
+  decode_gps_frames,
   decode_inferred,
   decode_position,
   decode_quality,
   decode_utc,
+  make_parser,
   should_publish,
 )
 
@@ -324,6 +333,47 @@ class TestBuildGpsMsg:
                         vdop=QUALITY_UNKNOWN["vdop"], sat_count=QUALITY_UNKNOWN["sat_count"],
                         has_fix=True)
     assert gps.gpsLocationExternal.horizontalAccuracy == pytest.approx(UNKNOWN_ACCURACY)
+
+
+class TestDecodeGpsFrames:
+  """The address pre-filter must be indistinguishable from the shared helper, for our
+  addresses. It exists only to skip work -- any behaviour difference is a bug."""
+
+  def _capnp(self, frames):
+    msg = messaging.new_message('can', len(frames))
+    for i, (addr, dat, src) in enumerate(frames):
+      msg.can[i].address = addr
+      msg.can[i].dat = dat
+      msg.can[i].src = src
+    return msg.to_bytes()
+
+  def test_matches_the_shared_helper_on_our_addresses(self):
+    frames = [(GPS_ADDR_POS, b"\x01" * 8, 0), (0x100, b"\x02" * 8, 0),
+              (GPS_ADDR_TIME, b"\x03" * 8, 0), (0x3C3, b"\x04" * 64, 0),
+              (GPS_ADDR_QUALITY, b"\x05" * 8, 0)]
+    raw = [self._capnp(frames)]
+    ours = decode_gps_frames(raw)
+    theirs = can_capnp_to_list(raw)
+    assert ours[0][0] == theirs[0][0]  # same logMonoTime
+    assert ours[0][1] == [f for f in theirs[0][1] if f[0] in GPS_ADDRS]
+
+  def test_drops_everything_else(self):
+    raw = [self._capnp([(0x100, b"\x00" * 8, 0), (0x3C3, b"\x00" * 8, 0)])]
+    assert decode_gps_frames(raw)[0][1] == []
+
+  def test_keeps_other_buses_for_the_parser_to_reject(self):
+    # Bus filtering is CANParser.update's job; we must not silently pre-empt it.
+    raw = [self._capnp([(GPS_ADDR_POS, b"\x06" * 8, 2)])]
+    assert [f[2] for f in decode_gps_frames(raw)[0][1]] == [2]
+
+  def test_empty_input_is_empty_output(self):
+    assert decode_gps_frames([]) == []
+    assert decode_gps_frames([self._capnp([])])[0][1] == []
+
+  def test_addrs_match_the_parser(self):
+    # Drift between GPS_ADDRS and make_parser() would decode as a permanently absent
+    # message rather than fail loudly, since the filter runs before the parser.
+    assert set(make_parser("ford_lincoln_base_pt", 0).addresses) == set(GPS_ADDRS)
 
 
 class TestShouldPublish:
