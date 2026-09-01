@@ -11,12 +11,18 @@ speed_limit_resolver.py, mapd, and athenad all keep working unmodified
 own GPS daemon is gated off elsewhere so msgq's one-publisher-per-topic rule
 doesn't collide.
 
-Which topic that is depends on the hardware, and we do not get to choose: consumers pick
+Which topic that is depends on the device, and we do not get to choose: consumers pick
 between gpsLocationExternal and gpsLocation on UbloxAvailable (common/gps.py, and
-locationd.cc in trees whose locationd reads GPS). So the topic is resolved through the same
-get_gps_location_service() the consumers use -- gpsLocationExternal on a ublox device (comma
-three), gpsLocation on a Quectel one (every comma 3X). Publishing the other one would reach
-nobody, which is exactly what a 3X user found when the toggle appeared to do nothing.
+locationd.cc in trees whose locationd reads GPS), so the topic is resolved through the same
+get_gps_location_service() the consumers use. gpsLocationExternal where ublox_available()
+is true, gpsLocation where it is not. Publishing the other one reaches nobody, which is
+what a comma 3X user saw when the toggle appeared to do nothing.
+
+Do not shortcut that to a device model. ublox_available() is a probe, not a lookup: it
+tests for /dev/ttyHS0 and for the /persist/comma/use-quectel-gps override, so a board with
+both receivers can be flipped either way and one model does not imply one answer. Every
+comma 3X is Quectel; the comma 4 this daemon was developed and driven on probes ublox, but
+that is one device, not a claim about the model.
 
 The daemon runs in one of two modes. As the selected GPS source it publishes, as it always
 has. Otherwise it runs as an observer: it decodes the same CAN messages but sends nothing,
@@ -305,8 +311,8 @@ def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float |
 
   `service` is the topic to shape the message for -- gpsLocationExternal or gpsLocation.
   Both carry the same GpsLocationData, so this only picks which union field to fill. It
-  defaults to gpsLocationExternal so callers and tests that predate Quectel support, and
-  the offline replay scripts, are unchanged.
+  defaults to gpsLocationExternal so callers and tests that predate the gpsLocation path,
+  and the offline replay scripts, are unchanged.
 
   A None means the car never told us. GpsLocationData has no way to say "unknown" for a
   value, only an accuracy alongside it, so the value goes out as 0 and the matching
@@ -571,8 +577,8 @@ def main() -> NoReturn:
   can_sock = messaging.sub_sock('can', timeout=20)
 
   publishing, arbiter = select_mode(params, CP)
-  # Resolve the topic the same way every consumer does, so it cannot drift from them: the
-  # ublox device reads gpsLocationExternal, the Quectel device reads gpsLocation. This is
+  # Resolve the topic the same way every consumer does, so it cannot drift from them:
+  # gpsLocationExternal where the device has a working ublox, gpsLocation otherwise. This is
   # also the topic the device's own GPS daemon owns, which is what makes it the one to
   # observe when we are not publishing.
   gps_service = get_gps_location_service(params)

@@ -71,10 +71,10 @@ def can_gps_capable(started: bool, params: Params, CP: car.CarParams) -> bool:
   """Could CAN GPS work here at all? Ford is the only brand whose DBC carries a fix.
 
   Deliberately not gated on ublox_available(). It was, back when cangpsd hardcoded
-  gpsLocationExternal -- on a Quectel device every consumer reads gpsLocation instead, so
-  that publish would have reached nobody and the toggle only looked like it worked. cangpsd
-  now resolves its topic through get_gps_location_service(), the same call the consumers
-  make, so it is useful on both; whichever device GPS daemon owns that topic yields below.
+  gpsLocationExternal -- where that probe is false every consumer reads gpsLocation instead,
+  so the publish reached nobody and the toggle only looked like it worked. cangpsd now
+  resolves its topic through get_gps_location_service(), the same call the consumers make,
+  so it is useful either way; whichever device GPS daemon owns that topic yields below.
   """
   brand, _ = _car_identity(CP)
   return started and brand == "ford"
@@ -97,8 +97,8 @@ def cangpsd(started: bool, params: Params, CP: car.CarParams) -> bool:
 def can_gps_publishing(started: bool, params: Params, CP: car.CarParams) -> bool:
   """Does cangpsd own the GPS topic right now? If so the device GPS daemon stands down.
 
-  Which daemon that is follows the hardware: ubloxd/pigeond on a ublox device, qcomgpsd on
-  a Quectel one. Both gates below consult this, and observer mode deliberately does not
+  Which daemon that is follows ublox_available(): ubloxd/pigeond when it is true, qcomgpsd
+  when it is not. Both gates below consult this, and observer mode deliberately does not
   reach it -- an observer publishes nothing, so nothing has to yield to it.
   """
   if not can_gps_capable(started, params, CP):
