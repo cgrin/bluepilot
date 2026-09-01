@@ -593,6 +593,17 @@ def make_pub_master(service: str = GPS_SERVICE_DEFAULT, attempts: int = 5, delay
 # should not count as driving time toward a threshold measured in minutes.
 MAX_ARBITER_DT = 0.5
 
+# How often to log what the arbiter is actually being fed. Purely diagnostic, and it exists
+# because of a failure that read as impossible from the logs alone: on 00000113/00000114 the
+# arbiter persisted *nothing* across 21 minutes of moving with the device receiver publishing
+# hasFix=False on all 5994 samples, which is exactly the case that should have accumulated
+# no_fix_s to the threshold twice over. Every input checked out after the fact -- code on the
+# device matched the branch, Params.put worked, state.settled was False, SubMaster.alive held
+# at this tick rate against a 100 Hz publisher -- so the only way to find it is to record the
+# inputs at the moment they are used rather than reconstruct them afterwards. Warning level so
+# it reaches the rlog; ~2 lines/min is nothing next to the 8089 frames/s on the bus.
+ARBITER_LOG_INTERVAL = 30.0
+
 
 def select_mode(params: Params, CP) -> tuple[bool, FallbackArbiter | None]:
   """Decide whether to publish this run, and set up the arbiter if it is ours to decide.
@@ -680,6 +691,9 @@ def main() -> NoReturn:
   ever_had_fix = False
   next_cp_check = now
   last_arbiter_now = now
+  # Fire the first diagnostic line on the first arbiter tick rather than 30 s in, so a drive
+  # that ends early still says something.
+  last_arbiter_log = now - ARBITER_LOG_INTERVAL
 
   rk = Ratekeeper(10, print_delay_threshold=None)
   last_publish = now - KEEPALIVE_INTERVAL
@@ -776,7 +790,20 @@ def main() -> NoReturn:
         # inferring, so passing raw has_fix would let a tunnel -- the one thing likely to
         # run the device receiver out to NO_FIX_TIMEOUT -- also satisfy the guard meant to
         # catch it. See CAN_FIX_MIN_S.
-        if arbiter.update(dt, moving, published_fix, has_fix and not inferred):
+        can_actual_fix = has_fix and not inferred
+        if now - last_arbiter_log >= ARBITER_LOG_INTERVAL:
+          last_arbiter_log = now
+          # Log the SubMaster liveness flags separately from the values derived off them: a
+          # dead carState socket and a genuinely stationary car both read as moving=False.
+          gps_alive = 'self' if publishing else sm.alive[gps_service]
+          fields = {
+            'dt': f"{dt:.3f}", 'moving': moving, 'cs_alive': sm.alive['carState'],
+            'vEgo': f"{sm['carState'].vEgo:.2f}", 'published_fix': published_fix,
+            'gps_alive': gps_alive, 'can_fix': can_actual_fix, 'has_fix': has_fix,
+            'inferred': inferred, 'state': json_state(arbiter.state),
+          }
+          cloudlog.warning("cangpsd arbiter: " + " ".join(f"{k}={v}" for k, v in fields.items()))
+        if arbiter.update(dt, moving, published_fix, can_actual_fix):
           save_state(params, arbiter.state)
           # Exit rather than swap the pub socket in place. manager re-reads the ubloxd gate
           # against the state just written and starts us again a moment later; going out
