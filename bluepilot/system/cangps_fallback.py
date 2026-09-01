@@ -1,17 +1,21 @@
 """Pick a GPS source for this car without asking the user.
 
-The problem cangpsd solves is invisible: a windshield that blocks the device's ublox
+The problem cangpsd solves is invisible: a windshield that blocks the device's own GPS
 antenna produces no error, no alert and no UI -- just routes stamped with the AGNOS flash
 date and a nav stack that never sees a position. Nobody goes looking for a toggle for a
 failure they have not noticed, so the toggle only ever helps people who already diagnosed
 it. This module makes the choice automatically instead.
 
-The rule is deliberately asymmetric. We leave ublox in charge until it has *proven* it
-cannot work -- many minutes of driving with no fix at all -- and we only switch away once
-the car's own CAN GPS has *positively* shown a fix in the same session. That ordering
-matters: a Ford with no 0x462 (or an APIM that never gets a fix of its own) must never end
-up worse off than stock, and "ublox is quiet" alone is not evidence that anything else
-would do better.
+The two sources are the *device* receiver -- whichever daemon owns it, ubloxd/pigeond on a
+comma three or qcomgpsd on a 3X -- and the car's own GPS on CAN. Which chip is fitted does
+not change any of the reasoning here, so the state records "device" rather than naming one.
+
+The rule is deliberately asymmetric. We leave the device receiver in charge until it has
+*proven* it cannot work -- many minutes of driving with no fix at all -- and we only switch
+away once the car's own CAN GPS has *positively* shown a fix in the same session. That
+ordering matters: a Ford with no 0x462 (or an APIM that never gets a fix of its own) must
+never end up worse off than stock, and "the device receiver is quiet" alone is not evidence
+that anything else would do better.
 
 Two things make the measurement honest:
 
@@ -37,10 +41,10 @@ from openpilot.common.swaglog import cloudlog
 
 FALLBACK_PARAM = "CanGpsFallbackState"
 
-# "ublox" is historical: it means whichever GPS daemon owns the device's own receiver --
-# ubloxd/pigeond on a comma three, qcomgpsd on a 3X. The distinction the state records is
-# device receiver vs. the car's CAN GPS, not which chip is fitted.
-SOURCE_UBLOX = "ublox"
+# Named for the receiver, not the daemon that reads it: "device" covers ubloxd/pigeond on a
+# comma three and qcomgpsd on a 3X. An earlier draft called this "ublox", which was only ever
+# true of one of the two.
+SOURCE_DEVICE = "device"
 SOURCE_CAN = "can"
 
 # Seconds of *moving* with no fix before a source is declared dead. Twenty minutes is
@@ -70,7 +74,7 @@ MAX_FLIPS = 3
 class FallbackState:
   """What we have decided about one vehicle, and how far along the current measurement is."""
   vin: str = ""
-  source: str = SOURCE_UBLOX
+  source: str = SOURCE_DEVICE
   no_fix_s: float = 0.0
   flips: int = 0
 
@@ -101,7 +105,7 @@ def load_state(params: Params, vin: str) -> FallbackState:
   try:
     state = FallbackState(
       vin=str(raw.get("vin", "")),
-      source=str(raw.get("source", SOURCE_UBLOX)),
+      source=str(raw.get("source", SOURCE_DEVICE)),
       no_fix_s=float(raw.get("no_fix_s", 0.0)),
       flips=int(raw.get("flips", 0)),
     )
@@ -109,7 +113,7 @@ def load_state(params: Params, vin: str) -> FallbackState:
     cloudlog.exception(f"cangps_fallback: {FALLBACK_PARAM} is malformed, starting over")
     return FallbackState(vin=vin)
 
-  if state.source not in (SOURCE_UBLOX, SOURCE_CAN):
+  if state.source not in (SOURCE_DEVICE, SOURCE_CAN):
     return FallbackState(vin=vin)
   # A decision about another car tells us nothing about this one.
   if vin and state.vin != vin:
@@ -176,21 +180,21 @@ class FallbackArbiter:
 
   def _switch(self, can_fix: bool) -> bool:
     """The active source has failed its threshold. Move only if there is somewhere to go."""
-    if self.state.source == SOURCE_UBLOX:
+    if self.state.source == SOURCE_DEVICE:
       if not can_fix:
-        # ublox is dead, but the car is not offering a working fix either -- this is a
-        # Ford with no GPS on CAN, or an APIM that has none right now. Switching would
-        # trade one silent source for another, so keep waiting and re-check in another
-        # NO_FIX_TIMEOUT of driving.
+        # The device receiver is dead, but the car is not offering a working fix either
+        # -- this is a Ford with no GPS on CAN, or an APIM that has none right now.
+        # Switching would trade one silent source for another, so keep waiting and
+        # re-check in another NO_FIX_TIMEOUT of driving.
         self.state.no_fix_s = 0.0
         self.dirty = True
         return False
       new_source = SOURCE_CAN
     else:
       # CAN GPS was selected and has now gone this long without a fix. Hand the topic back
-      # and let ublox have another go; if it fails too we will come back here, and the flip
-      # count bounds the loop.
-      new_source = SOURCE_UBLOX
+      # and let the device receiver have another go; if it fails too we will come back
+      # here, and the flip count bounds the loop.
+      new_source = SOURCE_DEVICE
 
     reason = f"after {self.state.no_fix_s:.0f}s of driving with no fix"
     cloudlog.warning(f"cangps_fallback: switching GPS source {self.state.source} -> {new_source} {reason}")

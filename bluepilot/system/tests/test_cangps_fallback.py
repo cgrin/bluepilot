@@ -12,7 +12,7 @@ from openpilot.bluepilot.system.cangps_fallback import (
   MAX_FLIPS,
   NO_FIX_TIMEOUT,
   SOURCE_CAN,
-  SOURCE_UBLOX,
+  SOURCE_DEVICE,
   FallbackArbiter,
   FallbackState,
   load_state,
@@ -34,7 +34,7 @@ class TestArbiter:
   def test_switches_to_can_after_the_threshold(self):
     a = FallbackArbiter(FallbackState(vin="VIN1"))
     assert drive(a, NO_FIX_TIMEOUT - 60) == 0
-    assert a.state.source == SOURCE_UBLOX
+    assert a.state.source == SOURCE_DEVICE
     # exactly to the threshold, so the switch is the last step -- past it the helper would
     # keep driving and start accumulating against the new source, as the daemon would only
     # do after restarting
@@ -51,7 +51,7 @@ class TestArbiter:
     drive(a, 1, published_fix=True)
     assert a.state.no_fix_s == 0.0
     assert drive(a, 120) == 0
-    assert a.state.source == SOURCE_UBLOX
+    assert a.state.source == SOURCE_DEVICE
 
   def test_parked_is_not_evidence(self):
     # The device can sit offroad for days under a carport. None of that says anything
@@ -59,14 +59,14 @@ class TestArbiter:
     a = FallbackArbiter(FallbackState(vin="VIN1"))
     assert drive(a, NO_FIX_TIMEOUT * 3, moving=False) == 0
     assert a.state.no_fix_s == 0.0
-    assert a.state.source == SOURCE_UBLOX
+    assert a.state.source == SOURCE_DEVICE
 
   def test_will_not_switch_to_a_car_with_no_fix_of_its_own(self):
     # A Ford with no 0x462, or an APIM that has no fix right now: switching would trade one
     # silent source for another and leave the driver worse off than stock.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
     assert drive(a, NO_FIX_TIMEOUT + 60, can_fix=False) == 0
-    assert a.state.source == SOURCE_UBLOX
+    assert a.state.source == SOURCE_DEVICE
     assert a.state.flips == 0
     # ...but it re-arms rather than giving up, so a car that acquires later still wins
     assert a.state.no_fix_s < NO_FIX_TIMEOUT
@@ -77,7 +77,7 @@ class TestArbiter:
     a = FallbackArbiter(FallbackState(vin="VIN1", source=SOURCE_CAN))
     # publishing mode: our own fix is the published one, and it is absent
     assert drive(a, NO_FIX_TIMEOUT + 60, can_fix=False) == 1
-    assert a.state.source == SOURCE_UBLOX
+    assert a.state.source == SOURCE_DEVICE
 
   def test_stops_flipping_after_max_flips(self):
     # Neither source works. Alternate a bounded number of times, then stay put on stock
@@ -149,6 +149,11 @@ class TestLoadState:
     p = FakeParams({"vin": "VIN1", "source": SOURCE_CAN, "no_fix_s": 0.0, "flips": 1})
     assert load_state(p, "").source == SOURCE_CAN
 
-  @pytest.mark.parametrize("raw", [None, {}, "garbage", {"source": "moon"}, {"no_fix_s": "abc"}])
+  # "ublox" is the name SOURCE_DEVICE carried in an unreleased draft. No device ever wrote
+  # it -- the auto-detect code was never deployed under that name -- so there is no
+  # migration path, only this: an unrecognised source resets to stock behaviour rather than
+  # leaving the daemon holding a value it cannot act on.
+  @pytest.mark.parametrize("raw", [None, {}, "garbage", {"source": "moon"},
+                                   {"source": "ublox"}, {"no_fix_s": "abc"}])
   def test_junk_falls_back_to_stock_behaviour(self, raw):
     assert load_state(FakeParams(raw), "VIN1") == FallbackState(vin="VIN1")
