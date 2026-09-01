@@ -24,9 +24,10 @@ The decision is per-vehicle and keyed on VIN, because a blocked windshield is a 
 of one physical car -- moving the device to another car re-tests from scratch.
 
 cangpsd can watch both sources at once even though only one may publish: msgq's
-one-publisher-per-topic rule constrains sending on gpsLocationExternal, not decoding CAN.
-So the observe mode reads 0x462/0x463 off the bus exactly as it would when publishing,
-while ubloxd still owns the topic, and the comparison is real rather than sequential.
+one-publisher-per-topic rule constrains sending on the GPS topic, not decoding CAN. So the
+observe mode reads 0x462/0x463 off the bus exactly as it would when publishing, while the
+device's own GPS daemon still owns the topic, and the comparison is real rather than
+sequential.
 """
 import json
 from dataclasses import asdict, dataclass
@@ -36,6 +37,9 @@ from openpilot.common.swaglog import cloudlog
 
 FALLBACK_PARAM = "CanGpsFallbackState"
 
+# "ublox" is historical: it means whichever GPS daemon owns the device's own receiver --
+# ubloxd/pigeond on a comma three, qcomgpsd on a 3X. The distinction the state records is
+# device receiver vs. the car's CAN GPS, not which chip is fitted.
 SOURCE_UBLOX = "ublox"
 SOURCE_CAN = "can"
 
