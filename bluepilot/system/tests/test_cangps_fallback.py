@@ -2,7 +2,7 @@
 
 The arbiter is deliberately a pure state machine over
 (dt, moving, published_fix, can_actual_fix),
-with no sockets or params, so a twenty-minute threshold can be exercised in a few hundred
+with no sockets or params, so a ten-minute threshold can be exercised in a few hundred
 microseconds. The cases that matter are the ones where it must *not* switch: a receiver
 that is merely in a tunnel, a car parked for a week, and a Ford whose own GPS is no better
 than the one we would be leaving.
@@ -86,14 +86,14 @@ class TestArbiter:
     # The commute case, and the reason this is not sampled at the threshold. Fifteen
     # minutes of open sky where the car is fixed and the device receiver is not, then a
     # tunnel that happens to cover the moment the threshold falls. The open-sky evidence
-    # decides it; where the car happens to be at minute twenty does not.
+    # decides it; where the car happens to be when the threshold falls does not.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
-    open_sky = NO_FIX_TIMEOUT - 5 * 60
+    open_sky = NO_FIX_TIMEOUT - 3 * 60
     assert drive(a, open_sky, can_actual_fix=True) == 0
     assert a.state.can_only_s == pytest.approx(open_sky)
     # into the tunnel: the car is dead reckoning now, so no further evidence accrues
     before = a.state.can_only_s
-    assert drive(a, 5 * 60 + DT, can_actual_fix=False) == 1
+    assert drive(a, 3 * 60 + DT, can_actual_fix=False) == 1
     assert a.state.source == SOURCE_CAN
     assert before == pytest.approx(open_sky)
 
@@ -133,7 +133,7 @@ class TestArbiter:
 
   def test_stops_flipping_after_max_flips(self):
     # Neither source works. Alternate a bounded number of times, then stay put rather than
-    # restarting the daemon every twenty minutes forever.
+    # restarting the daemon every NO_FIX_TIMEOUT forever.
     a = FallbackArbiter(FallbackState(vin="VIN1"))
     switches = drive(a, NO_FIX_TIMEOUT * (MAX_FLIPS + 3))
     assert switches == MAX_FLIPS
