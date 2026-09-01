@@ -226,6 +226,17 @@ class TestBuildGpsMsg:
   def test_source_is_car(self):
     assert str(self.build().source) == "car"
 
+  def test_builds_the_same_fix_on_gpsLocation(self):
+    # A Quectel device (every comma 3X) has UbloxAvailable False, so every consumer reads
+    # gpsLocation -- publishing gpsLocationExternal there reaches nobody. Both topics carry
+    # GpsLocationData, so the only thing `service` changes is which union field is filled.
+    args = dict(lat=47.6, lon=-122.3, altitude=30.0, speed=18.0, bearing_deg=90.0,
+                unix_timestamp_millis=1787790825000, hdop=0.6, vdop=0.8, sat_count=12,
+                has_fix=True)
+    quectel = build_gps_msg(**args, service='gpsLocation')
+    assert quectel.which() == 'gpsLocation'
+    assert quectel.gpsLocation.to_dict() == build_gps_msg(**args).gpsLocationExternal.to_dict()
+
   def test_accuracies_scale_from_dop(self):
     gps = self.build()
     assert gps.horizontalAccuracy == pytest.approx(0.6 * 5.0)

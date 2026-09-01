@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Publish gpsLocationExternal from the Ford CAN GPS solution.
+"""Publish the Ford CAN GPS solution as this device's GPS location.
 
 The comma device's ublox GPS can never get a fix in this Mach-E: the
 IR-reflective windshield blocks the antenna and there's no uncoated zone to
 mount in. The car itself broadcasts a full GPS solution on CAN bus 0 at
 ~1 Hz (APIMGPS_Data_Nav_1/2/3_FD1, DBC ford_lincoln_base_pt.dbc). This daemon
-decodes it and republishes gpsLocationExternal so system/timed.py,
-selfdrived.py, speed_limit_resolver.py, mapd, and athenad all keep working
-unmodified (locationd in this tree is camera+IMU only and never reads GPS).
-ubloxd is gated off elsewhere so msgq's one-publisher-per-topic rule doesn't
-collide.
+decodes it and republishes it so system/timed.py, selfdrived.py,
+speed_limit_resolver.py, mapd, and athenad all keep working unmodified
+(locationd in this tree is camera+IMU only and never reads GPS). The device's
+own GPS daemon is gated off elsewhere so msgq's one-publisher-per-topic rule
+doesn't collide.
+
+Which topic that is depends on the hardware, and we do not get to choose: consumers pick
+between gpsLocationExternal and gpsLocation on UbloxAvailable (common/gps.py, and
+locationd.cc in trees whose locationd reads GPS). So the topic is resolved through the same
+get_gps_location_service() the consumers use -- gpsLocationExternal on a ublox device (comma
+three), gpsLocation on a Quectel one (every comma 3X). Publishing the other one would reach
+nobody, which is exactly what a 3X user found when the toggle appeared to do nothing.
 
 The daemon runs in one of two modes. As the selected GPS source it publishes, as it always
 has. Otherwise it runs as an observer: it decodes the same CAN messages but sends nothing,
-and instead watches whether ublox is producing fixes -- see cangps_fallback, which owns the
-decision of when to take the topic over. Decoding CAN costs nothing extra while ubloxd
-owns gpsLocationExternal, since the one-publisher rule constrains sending, not reading.
+and instead watches whether the device receiver is producing fixes -- see cangps_fallback,
+which owns the decision of when to take the topic over. Decoding CAN costs nothing extra
+while the device daemon owns the topic, since the one-publisher rule constrains sending,
+not reading.
 
 Decode is split into pure functions (decode_utc, decode_position,
 decode_quality) that take plain dicts of already-scaled DBC signal values, so
@@ -39,6 +47,7 @@ from opendbc.car import Bus
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.values import DBC
 
+from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
@@ -53,6 +62,11 @@ from openpilot.bluepilot.system.cangps_fallback import (
   save_state,
   vehicle_key,
 )
+
+# The topic to publish on when nobody says otherwise. main() asks
+# get_gps_location_service() instead; this is only the default for direct callers -- the
+# unit tests and the offline replay scripts, which have no Params to consult.
+GPS_SERVICE_DEFAULT = 'gpsLocationExternal'
 
 # APIMGPS_Data_Nav_1_FD1: lat/lon degrees+minutes and hemisphere enums
 GPS_ADDR_POS = 0x462
@@ -285,8 +299,14 @@ def decode_quality(vl: dict) -> dict:
 def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float | None,
                    bearing_deg: float | None, unix_timestamp_millis: int, hdop: float | None,
                    vdop: float | None, sat_count: int,
-                   has_fix: bool, inferred: bool = False) -> capnp.lib.capnp._DynamicStructBuilder:
-  """Build a gpsLocationExternal message from already-decoded plain values.
+                   has_fix: bool, inferred: bool = False,
+                   service: str = GPS_SERVICE_DEFAULT) -> capnp.lib.capnp._DynamicStructBuilder:
+  """Build a GPS location message from already-decoded plain values.
+
+  `service` is the topic to shape the message for -- gpsLocationExternal or gpsLocation.
+  Both carry the same GpsLocationData, so this only picks which union field to fill. It
+  defaults to gpsLocationExternal so callers and tests that predate Quectel support, and
+  the offline replay scripts, are unchanged.
 
   A None means the car never told us. GpsLocationData has no way to say "unknown" for a
   value, only an accuracy alongside it, so the value goes out as 0 and the matching
@@ -295,8 +315,8 @@ def build_gps_msg(lat: float, lon: float, altitude: float | None, speed: float |
   -- a consumer that reads accuracy can tell them apart, and one that ignores accuracy is
   no worse off than it would be with a fabricated number.
   """
-  msg = messaging.new_message('gpsLocationExternal', valid=True)
-  gps = msg.gpsLocationExternal
+  msg = messaging.new_message(service, valid=True)
+  gps = getattr(msg, service)
   gps.latitude = lat
   gps.longitude = lon
   gps.altitude = altitude if altitude is not None else 0.0
@@ -478,21 +498,21 @@ def make_parser(dbc_name: str, can_bus: int) -> CANParser:
   ], can_bus)
 
 
-def make_pub_master(attempts: int = 5, delay: float = 1.0) -> messaging.PubMaster:
-  """Open the gpsLocationExternal pub socket, retrying with backoff.
+def make_pub_master(service: str = GPS_SERVICE_DEFAULT, attempts: int = 5, delay: float = 1.0) -> messaging.PubMaster:
+  """Open the GPS pub socket, retrying with backoff.
 
-  If UbloxAvailable was just flipped off while onroad, manager's
-  ensure_running stops ubloxd in the same pass that starts us, and msgq only
-  allows one publisher per topic -- so the socket can briefly still be held
-  by the outgoing process. Retry instead of crash-looping through manager.
+  When the selected source changes while onroad, manager's ensure_running stops the
+  outgoing publisher in the same pass that starts us, and msgq only allows one publisher
+  per topic -- so the socket can briefly still be held by that process. Retry instead of
+  crash-looping through manager.
   """
   last_exc: Exception | None = None
   for attempt in range(attempts):
     try:
-      return messaging.PubMaster(['gpsLocationExternal'])
+      return messaging.PubMaster([service])
     except Exception as e:
       last_exc = e
-      cloudlog.warning(f"cangpsd: failed to open gpsLocationExternal pub socket (attempt {attempt + 1}/{attempts}): {e}")
+      cloudlog.warning(f"cangpsd: failed to open {service} pub socket (attempt {attempt + 1}/{attempts}): {e}")
       time.sleep(delay)
   assert last_exc is not None
   raise last_exc
@@ -551,13 +571,19 @@ def main() -> NoReturn:
   can_sock = messaging.sub_sock('can', timeout=20)
 
   publishing, arbiter = select_mode(params, CP)
-  # Only open the pub socket when we are the selected source. In observer mode ubloxd holds
-  # it, and taking it would be the collision this whole arrangement exists to avoid.
-  pm = make_pub_master() if publishing else None
-  # carState for "is the car actually moving" (parked with no fix is not evidence), and
-  # gpsLocationExternal to see whether the source that currently owns the topic is working.
-  # In publishing mode that source is us, so we read our own has_fix directly instead.
-  observed = ['carState'] if publishing else ['carState', 'gpsLocationExternal']
+  # Resolve the topic the same way every consumer does, so it cannot drift from them: the
+  # ublox device reads gpsLocationExternal, the Quectel device reads gpsLocation. This is
+  # also the topic the device's own GPS daemon owns, which is what makes it the one to
+  # observe when we are not publishing.
+  gps_service = get_gps_location_service(params)
+  cloudlog.info(f"cangpsd {'publishing on' if publishing else 'observing'} {gps_service}")
+  # Only open the pub socket when we are the selected source. In observer mode the device
+  # daemon holds it, and taking it would be the collision this arrangement exists to avoid.
+  pm = make_pub_master(gps_service) if publishing else None
+  # carState for "is the car actually moving" (parked with no fix is not evidence), and the
+  # GPS topic to see whether the source that currently owns it is working. In publishing
+  # mode that source is us, so we read our own has_fix directly instead.
+  observed = ['carState'] if publishing else ['carState', gps_service]
   sm = messaging.SubMaster(observed) if arbiter is not None else None
 
   now = time.monotonic()
@@ -638,8 +664,8 @@ def main() -> NoReturn:
         inferred = fix.time_fresh(now) and decode_inferred(cp.vl[GPS_ADDR_TIME])
         msg = build_gps_msg(lat, lon, quality["altitude"], quality["speed"], quality["bearing_deg"],
                              publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix,
-                             inferred)
-        pm.send('gpsLocationExternal', msg)
+                             inferred, service=gps_service)
+        pm.send(gps_service, msg)
 
       if arbiter is not None:
         # The publish cadence is the arbiter's tick. KEEPALIVE_INTERVAL makes this branch
@@ -652,14 +678,14 @@ def main() -> NoReturn:
         # Who currently owns the topic decides where "is it working" comes from. As the
         # publisher that is our own fix; as an observer it is whatever ubloxd is sending,
         # and a topic that has gone silent entirely counts as no fix.
-        published_fix = has_fix if publishing else (sm.alive['gpsLocationExternal'] and
-                                                    sm['gpsLocationExternal'].hasFix)
+        published_fix = has_fix if publishing else (sm.alive[gps_service] and
+                                                    sm[gps_service].hasFix)
         if arbiter.update(dt, moving, published_fix, has_fix):
           save_state(params, arbiter.state)
           # Exit rather than swap the pub socket in place. manager re-reads the ubloxd gate
           # against the state just written and starts us again a moment later; going out
           # through process death is the only way to be sure the outgoing publisher has
-          # released gpsLocationExternal before the incoming one asks for it.
+          # released the GPS topic before the incoming one asks for it.
           cloudlog.warning("cangpsd: GPS source changed, restarting to hand over the topic")
           sys.exit(0)
         elif arbiter.take_dirty():

@@ -70,12 +70,14 @@ def _car_identity(CP: car.CarParams) -> tuple[str, str]:
 def can_gps_capable(started: bool, params: Params, CP: car.CarParams) -> bool:
   """Could CAN GPS work here at all? Ford is the only brand whose DBC carries a fix.
 
-  Only meaningful on ublox devices: with a Quectel modem, UbloxAvailable is False and every
-  consumer reads gpsLocation (qcomgpsd) instead, so publishing gpsLocationExternal would
-  reach nobody, and there would be no ublox failure to detect in the first place.
+  Deliberately not gated on ublox_available(). It was, back when cangpsd hardcoded
+  gpsLocationExternal -- on a Quectel device every consumer reads gpsLocation instead, so
+  that publish would have reached nobody and the toggle only looked like it worked. cangpsd
+  now resolves its topic through get_gps_location_service(), the same call the consumers
+  make, so it is useful on both; whichever device GPS daemon owns that topic yields below.
   """
   brand, _ = _car_identity(CP)
-  return started and ublox_available() and brand == "ford"
+  return started and brand == "ford"
 
 
 def cangpsd(started: bool, params: Params, CP: car.CarParams) -> bool:
@@ -84,7 +86,8 @@ def cangpsd(started: bool, params: Params, CP: car.CarParams) -> bool:
   Two independent flags, so the automatic path can be trialled without disturbing anyone
   relying on the manual one. FordPrefUseVehicleGps forces CAN GPS on, as it always has;
   FordPrefAutoVehicleGps hands the choice to cangps_fallback, which needs the daemon
-  running even when ublox still owns the topic so it has something to compare against.
+  running even while the device receiver still owns the topic, so it has something to
+  compare against.
   """
   if not can_gps_capable(started, params, CP):
     return False
@@ -92,7 +95,12 @@ def cangpsd(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 
 def can_gps_publishing(started: bool, params: Params, CP: car.CarParams) -> bool:
-  """Does cangpsd own gpsLocationExternal right now? If so ubloxd has to stand down."""
+  """Does cangpsd own the GPS topic right now? If so the device GPS daemon stands down.
+
+  Which daemon that is follows the hardware: ubloxd/pigeond on a ublox device, qcomgpsd on
+  a Quectel one. Both gates below consult this, and observer mode deliberately does not
+  reach it -- an observer publishes nothing, so nothing has to yield to it.
+  """
   if not can_gps_capable(started, params, CP):
     return False
   if params.get_bool("FordPrefUseVehicleGps"):
@@ -108,7 +116,8 @@ def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
     params.put_bool("UbloxAvailable", use_ublox, block=True)
   # Gate only the ubloxd/pigeond process start here; the UbloxAvailable param above stays driven
   # by raw ublox_available() so gpsLocationExternal/gpsLocation routing (common/gps.py,
-  # locationd.cc) is unaffected by whether cangpsd is providing GPS instead.
+  # locationd.cc) is unaffected by whether cangpsd is providing GPS instead. cangpsd reads
+  # that same routing to pick its topic, so flipping the param here would move it too.
   return started and use_ublox and not can_gps_publishing(started, params, CP)
 
 def joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
@@ -127,7 +136,9 @@ def not_long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("LongitudinalManeuverMode")
 
 def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and not ublox_available()
+  # Yield gpsLocation to cangpsd when it is the selected source, mirroring what the ublox
+  # gate does for ubloxd/pigeond. msgq allows only one publisher per topic.
+  return started and not ublox_available() and not can_gps_publishing(started, params, CP)
 
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
