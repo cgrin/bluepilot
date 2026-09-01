@@ -56,7 +56,7 @@ from opendbc.car.ford.values import DBC
 
 from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
-from openpilot.common.realtime import Ratekeeper
+from openpilot.common.realtime import Ratekeeper, set_core_affinity
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.bluepilot.system.cangps_fallback import (
@@ -614,6 +614,23 @@ def select_mode(params: Params, CP) -> tuple[bool, FallbackArbiter | None]:
 
 
 def main() -> NoReturn:
+  # Stay off the core card owns. card is pinned to core 4 at Priority.CTRL_HIGH and publishes
+  # carState at 100 Hz; calibrationd validates on sm.all_checks() over carState, so delaying
+  # card invalidates liveCalibration, which takes locationd's inputsOK down with it and then
+  # lagd/paramsd/torqued, until selfdrived refuses to engage on commIssue. That is not
+  # hypothetical: it is what observer mode did on 00000113/00000114 (2026-09-01), where core 4
+  # went 71.7% -> 86.3% and carState grew 43 gaps >20 ms per minute against zero on the
+  # publishing-mode drives. Observer mode is the only configuration that runs this daemon
+  # *alongside* ubloxd/pigeond rather than instead of them, so it is the only one with the
+  # headroom problem -- but the affinity is set unconditionally because the right answer in
+  # publishing mode is the same one.
+  #
+  # Deliberately set_core_affinity() and not config_realtime_process(): the measured problem is
+  # which core, not which priority. This is a 10 Hz observer with no deadline, so it has no
+  # business preempting anything on SCHED_FIFO, and config_realtime_process would also
+  # gc.disable() a loop that allocates per cycle.
+  set_core_affinity([0, 1, 2, 3])
+
   params = Params()
 
   # Start decoding from the previous drive's CarParams rather than blocking on the live one.
