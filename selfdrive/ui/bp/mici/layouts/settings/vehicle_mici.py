@@ -29,12 +29,17 @@ class VehicleLayoutMici(NavScroller):
     # it takes effect immediately, even while driving.
     self.use_vehicle_gps = BigParamControlBP("Use Vehicle GPS", "FordPrefUseVehicleGps")
     self.use_vehicle_gps.set_enabled(self._ford_vehicle_gps_supported)
+    # Same thing, decided automatically: watch the device receiver and switch only once it
+    # has proven it cannot get a fix and the car's GPS has proven it can.
+    self.auto_vehicle_gps = BigParamControlBP("Auto-detect Vehicle GPS", "FordPrefAutoVehicleGps")
+    self.auto_vehicle_gps.set_enabled(self._ford_vehicle_gps_supported)
     self.vbatt_pause_charging = BigParamFloatControl("12V Battery Limit", "vbatt_pause_charging", min=11.0, max=14.0, step=0.1)
 
     self._scroller.add_widgets([
       self.show_hands_free_ui,
       self.steer_angle_curvature,
       self.use_vehicle_gps,
+      self.auto_vehicle_gps,
       self.vbatt_pause_charging,
     ])
 
@@ -42,6 +47,7 @@ class VehicleLayoutMici(NavScroller):
       ("send_hands_free_cluster_msg", self.show_hands_free_ui),
       ("FordPrefSteerAngleCurvature", self.steer_angle_curvature),
       ("FordPrefUseVehicleGps", self.use_vehicle_gps),
+      ("FordPrefAutoVehicleGps", self.auto_vehicle_gps),
     )
 
     ui_state.add_offroad_transition_callback(self._update_toggles)

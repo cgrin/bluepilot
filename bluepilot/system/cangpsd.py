@@ -11,6 +11,12 @@ unmodified (locationd in this tree is camera+IMU only and never reads GPS).
 ubloxd is gated off elsewhere so msgq's one-publisher-per-topic rule doesn't
 collide.
 
+The daemon runs in one of two modes. As the selected GPS source it publishes, as it always
+has. Otherwise it runs as an observer: it decodes the same CAN messages but sends nothing,
+and instead watches whether ublox is producing fixes -- see cangps_fallback, which owns the
+decision of when to take the topic over. Decoding CAN costs nothing extra while ubloxd
+owns gpsLocationExternal, since the one-publisher rule constrains sending, not reading.
+
 Decode is split into pure functions (decode_utc, decode_position,
 decode_quality) that take plain dicts of already-scaled DBC signal values, so
 they can be unit-tested and replayed offline against a recorded rlog without
@@ -19,6 +25,7 @@ any cereal sockets -- see comma-gps-time/scripts/decode_can_gps.py.
 import datetime
 import enum
 import math
+import sys
 import time
 from dataclasses import dataclass
 from typing import NoReturn
@@ -37,6 +44,15 @@ from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.time_helpers import system_time_valid
 from openpilot.selfdrive.pandad import can_capnp_to_list
+from openpilot.bluepilot.system.cangps_fallback import (
+  MIN_SPEED,
+  SOURCE_CAN,
+  FallbackArbiter,
+  json_state,
+  load_state,
+  save_state,
+  vehicle_key,
+)
 
 # APIMGPS_Data_Nav_1_FD1: lat/lon degrees+minutes and hemisphere enums
 GPS_ADDR_POS = 0x462
@@ -482,6 +498,30 @@ def make_pub_master(attempts: int = 5, delay: float = 1.0) -> messaging.PubMaste
   raise last_exc
 
 
+# Cap the per-cycle timestep fed to the arbiter. A scheduling hiccup or a debugger pause
+# should not count as driving time toward a threshold measured in minutes.
+MAX_ARBITER_DT = 0.5
+
+
+def select_mode(params: Params, CP) -> tuple[bool, FallbackArbiter | None]:
+  """Decide whether to publish this run, and set up the arbiter if it is ours to decide.
+
+  The manual toggle wins outright and skips measurement entirely: a user who has ticked it
+  has already diagnosed the problem the arbiter exists to discover, and second-guessing
+  them by handing the topic back after twenty quiet minutes would be obnoxious.
+  """
+  if params.get_bool("FordPrefUseVehicleGps"):
+    cloudlog.info("cangpsd: publishing (FordPrefUseVehicleGps is set)")
+    return True, None
+
+  state = load_state(params, vehicle_key(CP))
+  arbiter = FallbackArbiter(state)
+  publishing = state.source == SOURCE_CAN
+  mode = 'publishing' if publishing else 'observing'
+  cloudlog.info(f"cangpsd: {mode}, fallback state {json_state(state)}")
+  return publishing, arbiter
+
+
 def main() -> NoReturn:
   params = Params()
 
@@ -509,13 +549,23 @@ def main() -> NoReturn:
   cp = make_parser(dbc_name, can_bus)
 
   can_sock = messaging.sub_sock('can', timeout=20)
-  pm = make_pub_master()
+
+  publishing, arbiter = select_mode(params, CP)
+  # Only open the pub socket when we are the selected source. In observer mode ubloxd holds
+  # it, and taking it would be the collision this whole arrangement exists to avoid.
+  pm = make_pub_master() if publishing else None
+  # carState for "is the car actually moving" (parked with no fix is not evidence), and
+  # gpsLocationExternal to see whether the source that currently owns the topic is working.
+  # In publishing mode that source is us, so we read our own has_fix directly instead.
+  observed = ['carState'] if publishing else ['carState', 'gpsLocationExternal']
+  sm = messaging.SubMaster(observed) if arbiter is not None else None
 
   now = time.monotonic()
   fix = FixTracker()
   had_fix = False
   ever_had_fix = False
   next_cp_check = now
+  last_arbiter_now = now
 
   rk = Ratekeeper(10, print_delay_threshold=None)
   last_publish = now - KEEPALIVE_INTERVAL
@@ -532,6 +582,15 @@ def main() -> NoReturn:
       live_CP = load_car_params(params, "CarParams")
       if live_CP is not None:
         live_cp_pending = False
+        # We chose publish-or-observe from the previous route's CarParams, and so did
+        # manager's ubloxd gate. If the device has moved to a different car since, the two
+        # will now disagree the moment manager re-reads the live CP -- it would start
+        # ubloxd while we are still publishing, putting two publishers on the topic. Bail
+        # out and let manager restart us against the right vehicle's decision.
+        live_key = vehicle_key(live_CP)
+        if arbiter is not None and live_key and live_key != arbiter.state.vin:
+          cloudlog.warning("cangpsd: different vehicle than last route, restarting to re-decide")
+          sys.exit(0)
         if parser_config(live_CP) != (dbc_name, can_bus):
           dbc_name, can_bus = parser_config(live_CP)
           cloudlog.warning(f"cangpsd: car changed since last route, re-parsing {live_CP.carFingerprint} on bus {can_bus}")
@@ -568,7 +627,7 @@ def main() -> NoReturn:
       # SubMaster.alive true for consumers once we are a working GPS; before that there is
       # nothing to hold up, and a zeroed sample (lat/lon 0, publish_millis 0 -> 1970) is
       # indistinguishable on the wire from a receiver that is present and failing.
-      if ever_had_fix:
+      if pm is not None and ever_had_fix:
         lat, lon = (position[0], position[1]) if position is not None else (0.0, 0.0)
         # Covers both "this car has no 0x464" (Focus MK4) and "0x464 has gone quiet":
         # stale altitude/speed/bearing are worse than admitting we do not know.
@@ -581,6 +640,30 @@ def main() -> NoReturn:
                              publish_millis, quality["hdop"], quality["vdop"], quality["sat_count"], has_fix,
                              inferred)
         pm.send('gpsLocationExternal', msg)
+
+      if arbiter is not None:
+        # The publish cadence is the arbiter's tick. KEEPALIVE_INTERVAL makes this branch
+        # run at least every 0.5 s even with no CAN traffic at all, which is exactly the
+        # case that has to keep accumulating.
+        dt = min(now - last_arbiter_now, MAX_ARBITER_DT)
+        last_arbiter_now = now
+        sm.update(0)
+        moving = sm.alive['carState'] and sm['carState'].vEgo > MIN_SPEED
+        # Who currently owns the topic decides where "is it working" comes from. As the
+        # publisher that is our own fix; as an observer it is whatever ubloxd is sending,
+        # and a topic that has gone silent entirely counts as no fix.
+        published_fix = has_fix if publishing else (sm.alive['gpsLocationExternal'] and
+                                                    sm['gpsLocationExternal'].hasFix)
+        if arbiter.update(dt, moving, published_fix, has_fix):
+          save_state(params, arbiter.state)
+          # Exit rather than swap the pub socket in place. manager re-reads the ubloxd gate
+          # against the state just written and starts us again a moment later; going out
+          # through process death is the only way to be sure the outgoing publisher has
+          # released gpsLocationExternal before the incoming one asks for it.
+          cloudlog.warning("cangpsd: GPS source changed, restarting to hand over the topic")
+          sys.exit(0)
+        elif arbiter.take_dirty():
+          save_state(params, arbiter.state)
 
     rk.keep_time()
 
