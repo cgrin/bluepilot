@@ -13,7 +13,7 @@ reasoning here, so the state records "device" rather than naming one.
 
 The rule is deliberately asymmetric. We leave the device receiver in charge until it has
 *proven* it cannot work -- many minutes of driving with no fix at all -- and we only switch
-away once the car's own CAN GPS has *positively* shown a fix in the same session. That
+away once the car's own CAN GPS has positively shown a fix of its own that we believe. That
 ordering matters: a Ford with no 0x462 (or an APIM that never gets a fix of its own) must
 never end up worse off than stock, and "the device receiver is quiet" alone is not evidence
 that anything else would do better.
@@ -71,13 +71,31 @@ PERSIST_INTERVAL = 60.0
 #
 # Note where it freezes: the flips strictly alternate from SOURCE_DEVICE, so the third one
 # always lands on SOURCE_CAN. That is deliberate, not an accident of the count -- switching
-# *to* CAN requires positive proof that the car has a fix of its own (`can_fix`), while
+# *to* CAN requires positive proof that the car has a real fix of its own, while
 # switching back to the device receiver requires no such evidence. The transitions toward
 # CAN are the better-evidenced ones, so if we must give up somewhere, give up there. An
 # even MAX_FLIPS would settle on the device receiver instead; that would be the choice to
 # make if resting on stock behaviour ever matters more than resting on the source we have
 # actually seen work.
 MAX_FLIPS = 3
+
+# How long the car's own GPS must have been holding a real fix before we will switch to it.
+#
+# Two weaknesses in the obvious "is the car reporting a fix right now" check make this
+# necessary, and a tunnel triggers both at once. First, the check would be a single sample
+# taken at the instant the threshold is crossed, so one lucky cycle would be enough.
+# Second, and worse: the APIM asserts a fix while it is dead reckoning -- that is the 15.7%
+# of frames the drives found flagged GPS_Actual_vs_Infer_pos -- so "the car has a fix" is
+# true underground. A tunnel is the one condition that can plausibly run the device
+# receiver out to NO_FIX_TIMEOUT, and it is exactly when the naive guard fails open.
+#
+# So the caller passes only *actual* (not inferred) fixes, and they have to have been
+# continuous for this long. Any inferred or missing frame resets the run to zero. Thirty
+# seconds is short next to the twenty-minute threshold it guards -- on a car whose APIM
+# works this is met continuously while driving -- but long enough that a blip cannot carry
+# the decision. Being refused costs nothing but another NO_FIX_TIMEOUT of waiting, so this
+# is deliberately biased toward refusing.
+CAN_FIX_MIN_S = 30.0
 
 
 @dataclass
@@ -149,20 +167,34 @@ class FallbackArbiter:
   """Accumulates evidence about the active GPS source and decides when to switch.
 
   Fed once per cycle with what the daemon can see: whether the car is moving, whether
-  anything is publishing a fix on gpsLocationExternal, and whether the CAN GPS has a fix
-  of its own. `update` returns True on the cycle the selection changes; the caller is
-  expected to persist the state and restart so the new source owns the topic cleanly.
+  anything is publishing a fix on the GPS topic, and whether the CAN GPS currently has a
+  real (not dead-reckoned) fix of its own. `update` returns True on the cycle the selection
+  changes; the caller is expected to persist the state and restart so the new source owns
+  the topic cleanly.
   """
 
   def __init__(self, state: FallbackState):
     self.state = state
     self.since_persist = 0.0
     self.dirty = False
+    # Evidence about the *candidate*, not the incumbent, and deliberately not persisted:
+    # it is a claim about right now, and a stored one would let a run that ended before the
+    # last reboot authorise a switch after it.
+    self.can_actual_s = 0.0
 
-  def update(self, dt: float, moving: bool, published_fix: bool, can_fix: bool) -> bool:
-    """Advance the measurement by `dt` seconds. True if the selected source changed."""
+  def update(self, dt: float, moving: bool, published_fix: bool, can_actual_fix: bool) -> bool:
+    """Advance the measurement by `dt` seconds. True if the selected source changed.
+
+    `can_actual_fix` must be an *actual* CAN fix -- the caller is responsible for excluding
+    dead-reckoned ones, since the APIM reports a fix either way.
+    """
     if self.state.settled:
       return False
+
+    # Accrue before the early returns below. This measures the candidate source, so unlike
+    # the no-fix accumulator it is not conditioned on moving or on the incumbent's state --
+    # a car sitting with a good fix is still telling us its GPS works.
+    self.can_actual_s = self.can_actual_s + dt if can_actual_fix else 0.0
 
     if published_fix:
       # One fix is proof the active source works. Anything we had accumulated against it
@@ -186,14 +218,15 @@ class FallbackArbiter:
     if self.state.no_fix_s < NO_FIX_TIMEOUT:
       return False
 
-    return self._switch(can_fix)
+    return self._switch(self.can_actual_s >= CAN_FIX_MIN_S)
 
-  def _switch(self, can_fix: bool) -> bool:
+  def _switch(self, can_ready: bool) -> bool:
     """The active source has failed its threshold. Move only if there is somewhere to go."""
     if self.state.source == SOURCE_DEVICE:
-      if not can_fix:
-        # The device receiver is dead, but the car is not offering a working fix either
-        # -- this is a Ford with no GPS on CAN, or an APIM that has none right now.
+      if not can_ready:
+        # The device receiver is dead, but the car is not offering a fix we believe -- a
+        # Ford with no GPS on CAN, an APIM that has none right now, or one that is dead
+        # reckoning through the same tunnel that just ran the device receiver out.
         # Switching would trade one silent source for another, so keep waiting and
         # re-check in another NO_FIX_TIMEOUT of driving.
         self.state.no_fix_s = 0.0
