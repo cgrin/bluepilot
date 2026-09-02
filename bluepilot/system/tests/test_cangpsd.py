@@ -16,6 +16,7 @@ import pytest
 import cereal.messaging as messaging
 from openpilot.selfdrive.pandad import can_capnp_to_list
 
+from openpilot.bluepilot.system.cangps_fallback import MIN_SPEED
 from openpilot.bluepilot.system.cangpsd import (
   GPS_ADDR_POS,
   GPS_ADDR_QUALITY,
@@ -26,6 +27,8 @@ from openpilot.bluepilot.system.cangpsd import (
   KEEPALIVE_INTERVAL,
   MAX_FIX_AGE,
   NO_TIME_GRACE,
+  PARSED_ADDRS,
+  PARSED_MESSAGES,
   QUALITY_UNKNOWN,
   UNKNOWN_ACCURACY,
   UNKNOWN_BEARING_ACCURACY,
@@ -33,10 +36,12 @@ from openpilot.bluepilot.system.cangpsd import (
   FixTracker,
   TimeSource,
   build_gps_msg,
-  decode_gps_frames,
+  SPEED_ADDR,
   decode_inferred,
+  decode_parsed_frames,
   decode_position,
   decode_quality,
+  decode_speed,
   decode_utc,
   make_parser,
   should_publish,
@@ -353,30 +358,53 @@ class TestDecodeGpsFrames:
               (GPS_ADDR_TIME, b"\x03" * 8, 0), (0x3C3, b"\x04" * 64, 0),
               (GPS_ADDR_QUALITY, b"\x05" * 8, 0)]
     raw = [self._capnp(frames)]
-    ours = decode_gps_frames(raw)
+    ours = decode_parsed_frames(raw)
     theirs = can_capnp_to_list(raw)
     assert ours[0][0] == theirs[0][0]  # same logMonoTime
-    assert ours[0][1] == [f for f in theirs[0][1] if f[0] in GPS_ADDRS]
+    assert ours[0][1] == [f for f in theirs[0][1] if f[0] in PARSED_ADDRS]
 
   def test_drops_everything_else(self):
     raw = [self._capnp([(0x100, b"\x00" * 8, 0), (0x3C3, b"\x00" * 8, 0)])]
-    assert decode_gps_frames(raw)[0][1] == []
+    assert decode_parsed_frames(raw)[0][1] == []
+
+  def test_keeps_the_speed_message(self):
+    # The arbiter's only source of vehicle speed; dropping it here would read as a car that
+    # never moves, which is precisely the failure this replaced a carState subscription over.
+    raw = [self._capnp([(SPEED_ADDR, b"\x07" * 8, 0)])]
+    assert [f[0] for f in decode_parsed_frames(raw)[0][1]] == [SPEED_ADDR]
 
   def test_keeps_other_buses_for_the_parser_to_reject(self):
     # Bus filtering is CANParser.update's job; we must not silently pre-empt it.
     raw = [self._capnp([(GPS_ADDR_POS, b"\x06" * 8, 2)])]
-    assert [f[2] for f in decode_gps_frames(raw)[0][1]] == [2]
+    assert [f[2] for f in decode_parsed_frames(raw)[0][1]] == [2]
 
   def test_empty_input_is_empty_output(self):
-    assert decode_gps_frames([]) == []
-    assert decode_gps_frames([self._capnp([])])[0][1] == []
+    assert decode_parsed_frames([]) == []
+    assert decode_parsed_frames([self._capnp([])])[0][1] == []
 
   def test_addrs_match_the_parser(self):
-    # GPS_MESSAGES is the single declaration both are built from, so this cannot drift by
+    # PARSED_MESSAGES is the single declaration both are built from, so this cannot drift by
     # editing one of two lists. It can still drift if a DBC renames a message out from under
-    # us -- then the parser registers nothing for it while GPS_ADDRS still lists the address.
-    assert set(make_parser("ford_lincoln_base_pt", 0).addresses) == set(GPS_ADDRS)
-    assert len(GPS_MESSAGES) == len(GPS_ADDRS)  # no duplicate addresses
+    # us -- then the parser registers nothing for it while PARSED_ADDRS still lists the
+    # address.
+    assert set(make_parser("ford_lincoln_base_pt", 0).addresses) == set(PARSED_ADDRS)
+    assert len(PARSED_MESSAGES) == len(PARSED_ADDRS)  # no duplicate addresses
+    assert len(GPS_MESSAGES) == len(GPS_ADDRS)
+    assert GPS_ADDRS < PARSED_ADDRS  # the speed message is the only non-GPS addition
+
+
+class TestDecodeSpeed:
+  def test_kph_to_ms(self):
+    assert decode_speed({"Veh_V_ActlBrk": 100.0}) == pytest.approx(27.7778, abs=1e-4)
+
+  def test_standstill(self):
+    assert decode_speed({"Veh_V_ActlBrk": 0.0}) == 0.0
+
+  def test_crosses_min_speed_where_carstate_would(self):
+    # MIN_SPEED is 0.5 m/s; this is the same signal carState.vEgo is built from, so the
+    # threshold must land in the same place it did before.
+    assert decode_speed({"Veh_V_ActlBrk": 1.7}) < MIN_SPEED
+    assert decode_speed({"Veh_V_ActlBrk": 1.9}) > MIN_SPEED
 
 
 class TestShouldPublish:
