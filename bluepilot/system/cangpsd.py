@@ -51,6 +51,7 @@ import cereal.messaging as messaging
 
 from opendbc.can.parser import CANParser
 from opendbc.car import Bus
+from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.ford.fordcan import CanBus
 from opendbc.car.ford.values import DBC
 
@@ -80,6 +81,8 @@ GPS_ADDR_POS = 0x462
 GPS_ADDR_TIME = 0x463
 # APIMGPS_Data_Nav_3_FD1: altitude, speed, heading, sat count, hdop/vdop
 GPS_ADDR_QUALITY = 0x464
+# BrakeSysFeatures: Veh_V_ActlBrk, the vehicle speed carstate.py derives carState.vEgo from
+SPEED_ADDR = 0x415
 
 # The one place a GPS message is declared. Both the CANParser and decode_gps_frames()'s
 # filter are built from this, because they must not disagree: the filter runs first, so a
@@ -98,12 +101,48 @@ GPS_MESSAGES = (
 )
 GPS_ADDRS = frozenset(address for _, address in GPS_MESSAGES)
 
+# The arbiter needs to know whether the car is moving, and takes it off CAN rather than from
+# a carState subscription. That is not a preference, it is a hard constraint: msgq allows
+# NUM_READERS = 15 readers per topic (msgq/msgq.h), and on the 16th msgq_init_subscriber does
+# not reject the newcomer -- it zeroes num_readers and invalidates *every* reader
+# ("Reset all subscribers to kick out inactive ones", msgq.cc). Each evicted reader notices
+# read_uid_local != read_uids[id] on its next recv and re-registers, evicting everyone again,
+# and msgq_reset_reader jumps each read pointer to the write pointer so queued messages are
+# dropped on the way through. With 16 live subscribers that is a permanent eviction storm,
+# not a one-off.
+#
+# carState already has 15 subscribers in this tree. An observer that subscribed to it was the
+# 16th, and it took the whole car down with it: measured on device with a 100 Hz publisher and
+# SubMaster readers polling at 2 Hz, 14 readers hold alive at 39-40/40 each while 16 readers
+# collapse to 0-6/40 *each* -- the incumbents starve too. That is what drives 00000113,
+# 00000114 and 00000116 (2026-09-01/02) actually hit: commIssue naming liveCalibration,
+# driverMonitoringState, liveDelay, liveParameters and longitudinalPlan (calibrationd,
+# dmonitoringd, lagd, paramsd, plannerd -- all carState subscribers), openpilot refusing to
+# engage, and this daemon's own cs_alive stuck False with vEgo frozen at 0.29 while the car
+# drove, so `moving` was never true and no_fix_s never advanced.
+#
+# Only the auto path ever broke, because select_mode returns (True, None) for the manual
+# toggle and the SubMaster was built only when an arbiter existed -- so the manual toggle
+# added no reader at all. Do not reintroduce one. Raising NUM_READERS is not the fix either:
+# it lives in the msgq submodule and the budget is shared with every other consumer.
+SPEED_MESSAGE = ("BrakeSysFeatures", SPEED_ADDR)
+
+# Parser and pre-filter are both built from this, for the reason GPS_MESSAGES gives above.
+PARSED_MESSAGES = GPS_MESSAGES + (SPEED_MESSAGE,)
+PARSED_ADDRS = frozenset(address for _, address in PARSED_MESSAGES)
+
 # capnp refuses to walk a large message without this. pandad's helper sets the same thing;
 # the `can` topic on a CAN FD car is well past the default limit.
 CAPNP_NO_TRAVERSAL_LIMIT = 2**64 - 1
 
 # both 0x462 and 0x463 are ~1 Hz; beyond this we can no longer trust the held fix
 MAX_FIX_AGE = 3.0
+
+# BrakeSysFeatures is 50 Hz, so this is a very loose "the car is still talking to us" bound
+# rather than a tight one. A stale speed must read as not-moving and not as the last value
+# seen: parked-with-no-fix is not evidence for switching source, and freezing at the last
+# motorway speed would accumulate no_fix_s forever with the ignition off.
+MAX_SPEED_AGE = 1.0
 
 # Publishing is phase-locked to the CAN burst rather than free-running: send as soon as
 # a new 0x463 lands, then a held repeat if the topic would otherwise go quiet.
@@ -513,12 +552,22 @@ def load_car_params(params: Params, key: str, block: bool = False) -> capnp.lib.
   return CP
 
 
+def decode_speed(vals: dict) -> float:
+  """Vehicle speed in m/s from BrakeSysFeatures.
+
+  Same signal carstate.py builds carState.vEgo from, minus the Kalman filter it runs on top.
+  The filter is smoothing for a controller running at 100 Hz; this is a 0.5 m/s threshold
+  sampled twice a second, so the raw value is what matters.
+  """
+  return vals["Veh_V_ActlBrk"] * CV.KPH_TO_MS
+
+
 def parser_config(CP: car.CarParams) -> tuple[str, int]:
   return DBC[CP.carFingerprint][Bus.pt], CanBus(CP).main
 
 
 def make_parser(dbc_name: str, can_bus: int) -> CANParser:
-  return CANParser(dbc_name, [(name, 1) for name, _ in GPS_MESSAGES], can_bus)
+  return CANParser(dbc_name, [(name, 1) for name, _ in PARSED_MESSAGES], can_bus)
 
 
 # Cached capnp schema field accessors, resolved on the first frame we see. Same trick as
@@ -526,8 +575,8 @@ def make_parser(dbc_name: str, can_bus: int) -> CANParser:
 _can_fields: tuple | None = None
 
 
-def decode_gps_frames(can_strs: list[bytes]) -> list[tuple[int, list[tuple]]]:
-  """can_capnp_to_list, but only for the three addresses we parse.
+def decode_parsed_frames(can_strs: list[bytes]) -> list[tuple[int, list[tuple]]]:
+  """can_capnp_to_list, but only for the four addresses we parse.
 
   Worth diverging from the shared helper here because of the ratio involved: this car puts
   ~8100 CAN frames/s on the topic and the GPS messages are 3 of them. The shared helper
@@ -536,11 +585,11 @@ def decode_gps_frames(can_strs: list[bytes]) -> list[tuple[int, list[tuple]]]:
   again to discard all but ours. Reading the address first and only building a tuple on a
   hit measured 4.34% -> 2.10% of a core on device, about 2 points off cangpsd's ~5.8%.
 
-  The filter set comes from GPS_MESSAGES, the same declaration the parser is built from, so
-  the two cannot drift apart.
+  The filter set comes from PARSED_MESSAGES, the same declaration the parser is built from,
+  so the two cannot drift apart.
 
-  Safe for cangpsd specifically, and not in general: pre-filtering makes the parser see an
-  empty bus on nearly every cycle, so last_nonempty_nanos and everything built on it
+  Safe for cangpsd specifically, and not in general: pre-filtering hides nearly all of the
+  bus from the parser, so last_nonempty_nanos and everything built on it
   (can_valid, bus_timeout) become meaningless. cangpsd never reads them -- it tracks
   staleness itself through FixTracker and MAX_FIX_AGE. A consumer that relies on the
   parser's own validity machinery must keep using the shared helper.
@@ -563,7 +612,7 @@ def decode_gps_frames(can_strs: list[bytes]) -> list[tuple[int, list[tuple]]]:
         addr_f, dat_f, src_f = _can_fields
         for f in frames:
           address = f._get_by_field(addr_f)
-          if address in GPS_ADDRS:
+          if address in PARSED_ADDRS:
             kept.append((address, f._get_by_field(dat_f), f._get_by_field(src_f)))
       result.append((event.logMonoTime, kept))
   return result
@@ -593,15 +642,16 @@ def make_pub_master(service: str = GPS_SERVICE_DEFAULT, attempts: int = 5, delay
 # should not count as driving time toward a threshold measured in minutes.
 MAX_ARBITER_DT = 0.5
 
-# How often to log what the arbiter is actually being fed. Purely diagnostic, and it exists
-# because of a failure that read as impossible from the logs alone: on 00000113/00000114 the
-# arbiter persisted *nothing* across 21 minutes of moving with the device receiver publishing
-# hasFix=False on all 5994 samples, which is exactly the case that should have accumulated
-# no_fix_s to the threshold twice over. Every input checked out after the fact -- code on the
-# device matched the branch, Params.put worked, state.settled was False, SubMaster.alive held
-# at this tick rate against a 100 Hz publisher -- so the only way to find it is to record the
-# inputs at the moment they are used rather than reconstruct them afterwards. Warning level so
-# it reaches the rlog; ~2 lines/min is nothing next to the 8089 frames/s on the bus.
+# How often to log what the arbiter is actually being fed. Purely diagnostic, and it earned
+# its place: on 00000113/00000114 the arbiter persisted *nothing* across 21 minutes of moving
+# with the device receiver publishing hasFix=False on all 5994 samples, and every input
+# checked out after the fact -- code on the device matched the branch, Params.put worked,
+# state.settled was False, and SubMaster held alive at this tick rate against a 100 Hz
+# publisher in isolation. Recording the inputs where they are used is what finally named it,
+# on the first drive that carried these lines: cs_alive=False every tick with vEgo frozen at
+# 0.29 while the car drove at 13.6 m/s, which is the msgq reader eviction SPEED_MESSAGE
+# describes. Reconstructing after the fact had not found it in two drives. Warning level so it
+# reaches the rlog; ~2 lines/min is nothing next to the 8089 frames/s on the bus.
 ARBITER_LOG_INTERVAL = 30.0
 
 
@@ -626,20 +676,19 @@ def select_mode(params: Params, CP) -> tuple[bool, FallbackArbiter | None]:
 
 def main() -> NoReturn:
   # Stay off the core card owns. card is pinned to core 4 at Priority.CTRL_HIGH and publishes
-  # carState at 100 Hz; calibrationd validates on sm.all_checks() over carState, so delaying
-  # card invalidates liveCalibration, which takes locationd's inputsOK down with it and then
-  # lagd/paramsd/torqued, until selfdrived refuses to engage on commIssue. That is not
-  # hypothetical: it is what observer mode did on 00000113/00000114 (2026-09-01), where core 4
-  # went 71.7% -> 86.3% and carState grew 43 gaps >20 ms per minute against zero on the
-  # publishing-mode drives. Observer mode is the only configuration that runs this daemon
-  # *alongside* ubloxd/pigeond rather than instead of them, so it is the only one with the
-  # headroom problem -- but the affinity is set unconditionally because the right answer in
-  # publishing mode is the same one.
+  # carState at 100 Hz, and observer mode is the only configuration that runs this daemon
+  # *alongside* ubloxd/pigeond rather than instead of them, so it is the only one that adds
+  # load rather than displacing it. Cheap hygiene for a 10 Hz observer with no deadline.
   #
-  # Deliberately set_core_affinity() and not config_realtime_process(): the measured problem is
-  # which core, not which priority. This is a 10 Hz observer with no deadline, so it has no
-  # business preempting anything on SCHED_FIFO, and config_realtime_process would also
-  # gc.disable() a loop that allocates per cycle.
+  # This is NOT what broke engagement on 00000113/00000114, though it was originally committed
+  # as the fix for it. Core 4 did go 71.7% -> 86.3% there, but pinning cangpsd away from it
+  # changed nothing: 00000116 failed identically with core 4 at 82.5%. The real cause was the
+  # carState subscription -- see SPEED_MESSAGE. The correlation was incidental, because
+  # observer mode adds a subscriber and CPU at the same time and only the subscriber mattered.
+  #
+  # Deliberately set_core_affinity() and not config_realtime_process(): this has no business
+  # preempting anything on SCHED_FIFO, and config_realtime_process would also gc.disable() a
+  # loop that allocates per cycle.
   set_core_affinity([0, 1, 2, 3])
 
   params = Params()
@@ -679,14 +728,16 @@ def main() -> NoReturn:
   # Only open the pub socket when we are the selected source. In observer mode the device
   # daemon holds it, and taking it would be the collision this arrangement exists to avoid.
   pm = make_pub_master(gps_service) if publishing else None
-  # carState for "is the car actually moving" (parked with no fix is not evidence), and the
-  # GPS topic to see whether the source that currently owns it is working. In publishing
-  # mode that source is us, so we read our own has_fix directly instead.
-  observed = ['carState'] if publishing else ['carState', gps_service]
-  sm = messaging.SubMaster(observed) if arbiter is not None else None
+  # The GPS topic, to see whether the source that currently owns it is working. In publishing
+  # mode that source is us, so we read our own has_fix directly and need no subscription at
+  # all. "Is the car actually moving" comes off CAN -- see SPEED_MESSAGE for why it must.
+  sm = messaging.SubMaster([gps_service]) if (arbiter is not None and not publishing) else None
 
   now = time.monotonic()
   fix = FixTracker()
+  # Seed as already stale, so a car that never sends BrakeSysFeatures reads as not moving
+  # rather than inheriting whatever cp.vl defaults to.
+  last_speed_now = now - MAX_SPEED_AGE
   had_fix = False
   ever_had_fix = False
   next_cp_check = now
@@ -727,7 +778,7 @@ def main() -> NoReturn:
 
     fresh_pos = fresh_time = False
     if can_strs:
-      updated = cp.update(decode_gps_frames(can_strs))
+      updated = cp.update(decode_parsed_frames(can_strs))
       if GPS_ADDR_POS in updated:
         fresh_pos = True
         fix.observe_position(now)
@@ -736,6 +787,8 @@ def main() -> NoReturn:
       if GPS_ADDR_TIME in updated:
         fresh_time = True
         fix.observe_time(now, decode_utc(cp.vl[GPS_ADDR_TIME]))
+      if SPEED_ADDR in updated:
+        last_speed_now = now
 
     if should_publish(fix.fresh_fix(now, fresh_time, fresh_pos), now, last_publish):
       last_publish = now
@@ -779,8 +832,13 @@ def main() -> NoReturn:
         # case that has to keep accumulating.
         dt = min(now - last_arbiter_now, MAX_ARBITER_DT)
         last_arbiter_now = now
-        sm.update(0)
-        moving = sm.alive['carState'] and sm['carState'].vEgo > MIN_SPEED
+        if sm is not None:
+          sm.update(0)
+        # Freshness first: a stale BrakeSysFeatures leaves cp.vl holding the last speed seen,
+        # which parked would keep accumulating no_fix_s indefinitely.
+        speed_fresh = now - last_speed_now < MAX_SPEED_AGE
+        v_ego = decode_speed(cp.vl[SPEED_ADDR]) if speed_fresh else 0.0
+        moving = speed_fresh and v_ego > MIN_SPEED
         # Who currently owns the topic decides where "is it working" comes from. As the
         # publisher that is our own fix; as an observer it is whatever the device's GPS
         # daemon is sending, and a topic that has gone silent entirely counts as no fix.
@@ -793,12 +851,12 @@ def main() -> NoReturn:
         can_actual_fix = has_fix and not inferred
         if now - last_arbiter_log >= ARBITER_LOG_INTERVAL:
           last_arbiter_log = now
-          # Log the SubMaster liveness flags separately from the values derived off them: a
-          # dead carState socket and a genuinely stationary car both read as moving=False.
+          # Log the liveness flags separately from the values derived off them: a silent CAN
+          # bus and a genuinely stationary car both read as moving=False.
           gps_alive = 'self' if publishing else sm.alive[gps_service]
           fields = {
-            'dt': f"{dt:.3f}", 'moving': moving, 'cs_alive': sm.alive['carState'],
-            'vEgo': f"{sm['carState'].vEgo:.2f}", 'published_fix': published_fix,
+            'dt': f"{dt:.3f}", 'moving': moving, 'speed_fresh': speed_fresh,
+            'vEgo': f"{v_ego:.2f}", 'published_fix': published_fix,
             'gps_alive': gps_alive, 'can_fix': can_actual_fix, 'has_fix': has_fix,
             'inferred': inferred, 'state': json_state(arbiter.state),
           }
