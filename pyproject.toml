@@ -140,6 +140,7 @@ markers = [
   "xdist_group_class_property: group tests by a property of the class that contains them",
 ]
 testpaths = [
+  "bluepilot/system/tests",
   "common",
   "selfdrive",
   "system",

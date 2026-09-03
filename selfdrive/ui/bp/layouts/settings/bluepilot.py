@@ -59,6 +59,14 @@ class BluePilotLayout(Widget):
     than leaving a live-looking control that silently does nothing."""
     return ui_state.CP is None or ui_state.CP.carFingerprint != "FORD_EDGE_MK2"
 
+  @staticmethod
+  def _ford_vehicle_gps_supported() -> bool:
+    """cangpsd only reads GPS off CAN on Ford vehicles -- grey out the toggle on other
+    brands rather than leaving a live-looking control that silently does nothing. CP is
+    None until a car is seen, and settings are usually opened offroad, so allow that case
+    or the toggle can never be turned on in the garage."""
+    return ui_state.CP is None or ui_state.CP.brand == "ford"
+
   def __init__(self):
     super().__init__()
     self._params = Params()
@@ -90,6 +98,8 @@ class BluePilotLayout(Widget):
       ("BPAnimateSteeringWheel", self._animate_steering_wheel),
       ("BPUseCustomSounds", self._use_custom_sounds),
       ("FordPrefShowRadarLeadOverlay", self._show_ford_radar_overlay),
+      ("FordPrefUseVehicleGps", self._use_vehicle_gps),
+      ("FordPrefAutoVehicleGps", self._auto_vehicle_gps),
       ("FordPrefHybridBatteryStatus", self._show_hybrid_battery_status),
       ("FordPrefHybridPowerFlow", self._show_hybrid_power_flow),
       ("enable_human_turn_detection_curv", self._enable_human_turn_detection),
@@ -275,6 +285,31 @@ class BluePilotLayout(Widget):
       initial_state=self._safe_get_bool(self._params, "FordPrefShowRadarLeadOverlay"),
       callback=lambda state: self._toggle_callback(state, "FordPrefShowRadarLeadOverlay"),
       icon="speed_limit.png"
+    )
+
+    # Ford CAN GPS toggle (windshield blocks device GPS on some vehicles)
+    self._use_vehicle_gps = toggle_item(
+      lambda: tr("Use Vehicle GPS (Ford)"),
+      lambda: tr("Read GPS position and time from the vehicle over CAN instead of the device's built-in GPS receiver. "
+                 + "Useful when the windshield blocks the device's GPS. Takes effect immediately, even while driving."),
+      initial_state=self._safe_get_bool(self._params, "FordPrefUseVehicleGps"),
+      callback=lambda state: self._toggle_callback(state, "FordPrefUseVehicleGps"),
+      icon="speed_limit.png",
+      enabled=self._ford_vehicle_gps_supported,
+    )
+
+    # Automatic version of the toggle above. The failure it works around is silent -- a
+    # blocked windshield produces no alert, just routes stamped with the flash date -- so
+    # most affected drivers never think to look for the manual toggle.
+    self._auto_vehicle_gps = toggle_item(
+      lambda: tr("Auto-detect Vehicle GPS (Ford)"),
+      lambda: tr("Watch the device's own GPS receiver, and switch to the vehicle's GPS automatically if it "
+                 + "never gets a fix while driving. Only switches once the vehicle's GPS is confirmed working, "
+                 + "and switches back if it isn't. Ignored while the toggle above is on."),
+      initial_state=self._safe_get_bool(self._params, "FordPrefAutoVehicleGps"),
+      callback=lambda state: self._toggle_callback(state, "FordPrefAutoVehicleGps"),
+      icon="speed_limit.png",
+      enabled=self._ford_vehicle_gps_supported,
     )
 
     # Ford radar overlay size selector (inline buttons like Driving Personality)
@@ -690,6 +725,8 @@ class BluePilotLayout(Widget):
       _section(tr("Vehicle"), [
         self._show_hands_free_ui,
         self._steer_angle_curvature,
+        self._use_vehicle_gps,
+        self._auto_vehicle_gps,
         self._vbatt_pause_charging,
       ]) +
       _section(tr("Audio"), [
