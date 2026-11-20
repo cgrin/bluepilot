@@ -23,17 +23,31 @@ class VehicleLayoutMici(NavScroller):
     # FORD_PINION_GEOMETRY_INDEX).
     self.steer_angle_curvature = BigParamControlBP("Use Pinion Yaw Sensor", "FordPrefSteerAngleCurvature")
     self.steer_angle_curvature.set_enabled(self._pinion_yaw_sensor_supported)
+    # cangpsd reads the car's own GPS off CAN and publishes it as gpsLocationExternal in
+    # place of ubloxd -- for vehicles whose windshield blocks the device's GPS antenna.
+    # Ford-only (the CAN decode is Ford-specific); manager swaps the processes live, so
+    # it takes effect immediately, even while driving.
+    self.use_vehicle_gps = BigParamControlBP("Use Vehicle GPS", "FordPrefUseVehicleGps")
+    self.use_vehicle_gps.set_enabled(self._ford_vehicle_gps_supported)
+    # Same thing, decided automatically: watch the device receiver and switch only once it
+    # has proven it cannot get a fix and the car's GPS has proven it can.
+    self.auto_vehicle_gps = BigParamControlBP("Auto-detect Vehicle GPS", "FordPrefAutoVehicleGps")
+    self.auto_vehicle_gps.set_enabled(self._ford_vehicle_gps_supported)
     self.vbatt_pause_charging = BigParamFloatControl("12V Battery Limit", "vbatt_pause_charging", min=11.0, max=14.0, step=0.1)
 
     self._scroller.add_widgets([
       self.show_hands_free_ui,
       self.steer_angle_curvature,
+      self.use_vehicle_gps,
+      self.auto_vehicle_gps,
       self.vbatt_pause_charging,
     ])
 
     self._refresh_toggles = (
       ("send_hands_free_cluster_msg", self.show_hands_free_ui),
       ("FordPrefSteerAngleCurvature", self.steer_angle_curvature),
+      ("FordPrefUseVehicleGps", self.use_vehicle_gps),
+      ("FordPrefAutoVehicleGps", self.auto_vehicle_gps),
     )
 
     ui_state.add_offroad_transition_callback(self._update_toggles)
@@ -41,6 +55,12 @@ class VehicleLayoutMici(NavScroller):
   @staticmethod
   def _pinion_yaw_sensor_supported() -> bool:
     return ui_state.CP is None or ui_state.CP.carFingerprint != "FORD_EDGE_MK2"
+
+  @staticmethod
+  def _ford_vehicle_gps_supported() -> bool:
+    # CP is None until a car is seen, and settings are usually opened offroad, so allow
+    # that case or the toggle can never be turned on in the garage.
+    return ui_state.CP is None or ui_state.CP.brand == "ford"
 
   def show_event(self):
     super().show_event()

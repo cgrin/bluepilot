@@ -17,6 +17,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AthenadRecentlyViewedRoutes", {PERSISTENT, STRING}},
     {"BootCount", {PERSISTENT, INT}},
     {"CalibrationParams", {PERSISTENT, BYTES}},
+    {"CanGpsFallbackState", {PERSISTENT | BACKUP, JSON, "{}"}},  // which GPS source cangpsd picked, per VIN
     {"CameraDebugExpGain", {CLEAR_ON_MANAGER_START, STRING}},
     {"CameraDebugExpTime", {CLEAR_ON_MANAGER_START, STRING}},
     {"CarBatteryCapacity", {PERSISTENT, INT}},
@@ -312,6 +313,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"FordHighSpeedDampening_ang", {PERSISTENT | BACKUP, FLOAT, "1.0"}},
     {"BPLateralSchemeParamsMigratedV1", {PERSISTENT | BACKUP, STRING, "0"}},
 
+    // BluePilot: angle-mode lane centering trim (advanced lane positioning) -- see
+    // opendbc/sunnypilot/car/ford/lane_center_trim.py.
+    {"enable_lane_positioning_ang", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"custom_path_offset_ang", {PERSISTENT | BACKUP, FLOAT, "0.0"}},
+    {"lane_centering_strength_ang", {PERSISTENT | BACKUP, FLOAT, "0.25"}},
+
     {"disable_BP_lat_UI", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"disable_BP_long_UI", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"disable_downhill_comp_UI", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -320,6 +327,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"show_lead_speed", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"FordPrefSteerAngleCurvature", {PERSISTENT | BACKUP, BOOL, "0"}},  // pinion-sourced curvature measurement (bad-yaw-sensor workaround); read at car init
     {"FordPrefShowRadarLeadOverlay", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"FordPrefUseVehicleGps", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"FordPrefAutoVehicleGps", {PERSISTENT | BACKUP, BOOL, "0"}},  // let cangpsd decide, instead of the toggle above
     {"FordPrefRadarOverlaySize", {PERSISTENT | BACKUP, INT, "1"}},
     {"FordPrefHybridBatteryStatus", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"FordPrefHybridPowerFlow", {PERSISTENT | BACKUP, BOOL, "0"}},
